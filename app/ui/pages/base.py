@@ -31,9 +31,9 @@ class Page(QWidget):
         self.subtitle = w.label(self.blurb, "pagesub", wrap=True)
         words.addWidget(self.subtitle)
         head.addLayout(words, 1)
-        self.actions = QHBoxLayout()
-        self.actions.setSpacing(6)
-        head.addLayout(self.actions)
+        self.header_actions = QHBoxLayout()
+        self.header_actions.setSpacing(6)
+        head.addLayout(self.header_actions)
         outer.addLayout(head)
 
         self.banner = w.Banner()

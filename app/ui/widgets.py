@@ -302,8 +302,8 @@ class Banner(QFrame):
         layout.setContentsMargins(12, 8, 8, 8)
         self.text = label(text, wrap=True)
         layout.addWidget(self.text, 1)
-        self.actions = QHBoxLayout()
-        layout.addLayout(self.actions)
+        self.side = QHBoxLayout()
+        layout.addLayout(self.side)
 
     def set(self, text: str, tone: str | None = None) -> None:
         self.text.setText(text)

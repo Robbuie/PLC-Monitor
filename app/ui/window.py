@@ -332,7 +332,7 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         kind = event.type()
         if kind in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.HoverMove) and \
-                isinstance(obj, QWidget) and obj.window() is self and not self.native:
+                isinstance(obj, QWidget) and QWidget.window(obj) is self and not self.native:
             pos = self.mapFromGlobal(event.globalPosition().toPoint()) if hasattr(event, "globalPosition") else None
             if pos is not None:
                 edges = self._edges(pos)

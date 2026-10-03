@@ -192,16 +192,16 @@ class LatencyPage(Page):
             column.addStretch(1)
             sides.addLayout(column, 1)
         setup.body.addLayout(sides)
-        self.window = QSpinBox()
-        self.window.setRange(1, 3_600_000)
-        self.window.setValue(5000)
-        self.window.setSuffix(" ms")
-        self.window.setSingleStep(500)
+        self.give_up = QSpinBox()
+        self.give_up.setRange(1, 3_600_000)
+        self.give_up.setValue(5000)
+        self.give_up.setSuffix(" ms")
+        self.give_up.setSingleStep(500)
         self.go = w.button("Measure", "primary", icon_name="latency", slot=self.measure)
         self.export_btn = w.button("Export CSV", icon_name="download", slot=self._export)
         self.export_btn.setEnabled(False)
         setup.body.addLayout(w.row(
-            w.label("Give up after", "fieldlabel"), self.window,
+            w.label("Give up after", "fieldlabel"), self.give_up,
             w.label("A response later than this, or after the next trigger, does not count.",
                     "hint"), None, self.export_btn, self.go))
         self.body.addWidget(setup)
@@ -311,7 +311,7 @@ class LatencyPage(Page):
         start = None
         if minutes:
             start = int((datetime.now() - timedelta(minutes=minutes)).timestamp() * 1000)
-        window = self.window.value()
+        window = self.give_up.value()
         self.go.setEnabled(False)
         self.summary.setText("Measuring...")
         label = f"{trigger.describe()} to the next {response.describe()}"

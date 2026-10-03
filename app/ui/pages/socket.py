@@ -142,7 +142,7 @@ class SocketPage(Page):
         about.body.addWidget(self.points)
         self.ready = w.Banner("", "info")
         self.elevate = w.button("Restart as administrator", slot=self._elevate)
-        self.ready.actions.addWidget(self.elevate)
+        self.ready.side.addWidget(self.elevate)
         about.body.addWidget(self.ready)
         about.body.addStretch(1)
         split.addWidget(about)

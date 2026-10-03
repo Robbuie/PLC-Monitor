@@ -214,6 +214,14 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 
 ## Changelog
 
+### 1.0.1 -- 2026-10-02
+
+- Fixed: moving the mouse over the window printed an error on every move
+  (the Latency page's "Give up after" field was named in a way that hid a
+  Qt method the window relies on). Renamed it and two others like it, and
+  added tests that catch the whole class of mistake.
+- Fixed: a font-size warning from the Live log's event badges.
+
 ### 1.0.0 -- 2026-10-02
 
 Rebuilt to match the family (File Manager, NetControl, Redline PDF) and cleaned up.

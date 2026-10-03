@@ -4,5 +4,5 @@ Built to answer one question -- how long between the PLC changing and the
 downstream system reacting -- and to keep answering it unattended.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 APP_NAME = "PLC Monitor"

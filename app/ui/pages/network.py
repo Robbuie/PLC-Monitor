@@ -135,7 +135,7 @@ class NetworkPage(Page):
         self.nc_btn = w.button("Open in NetControl", icon_name="external", slot=self._netcontrol,
                                tip="Hand this device to NetControl: ping, protocol-verified "
                                    "service check, link and error counters.")
-        self.actions.addWidget(self.nc_btn)
+        self.header_actions.addWidget(self.nc_btn)
 
         split = QSplitter(Qt.Vertical)
         split.setChildrenCollapsible(False)

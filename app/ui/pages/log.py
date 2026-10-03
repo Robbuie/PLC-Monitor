@@ -178,7 +178,11 @@ class BadgeDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         font = QFont(option.font)
-        font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
+        # The sheet sets sizes in pixels, so pointSizeF() is -1 here.
+        if font.pixelSize() > 0:
+            font.setPixelSize(max(10, font.pixelSize() - 1))
+        else:
+            font.setPointSizeF(max(7.5, font.pointSizeF() - 1.0))
         font.setWeight(QFont.DemiBold)
         painter.setFont(font)
         label = text.replace("_", " ").title().replace("Plc", "PLC").replace("Sock ", "")
@@ -264,8 +268,8 @@ class LogPage(Page):
         files = w.Card("Log files")
         self.path = w.label("", "mono", wrap=True, selectable=True)
         files.body.addWidget(self.path)
-        self.size = w.label("", "hint")
-        files.body.addWidget(self.size)
+        self.size_label = w.label("", "hint")
+        files.body.addWidget(self.size_label)
         files.body.addLayout(w.row(
             w.button("Open", icon_name="external", slot=self._open_file, tip="Open the CSV"),
             w.button("Folder", icon_name="folder", slot=self._open_folder,
@@ -377,7 +381,7 @@ class LogPage(Page):
             self.archives.item(0).setFlags(Qt.NoItemFlags)
 
     def _refresh_size(self) -> None:
-        self.size.setText(f"{self.session.logger.current_size_mb():.2f} MB in the current file")
+        self.size_label.setText(f"{self.session.logger.current_size_mb():.2f} MB in the current file")
 
     def _open_file(self) -> None:
         path = self.session.logger.log_path
