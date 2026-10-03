@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+build/
+dist/
+packaging/version_info.txt
+previews/
+plctag.dll
+*.log
+plc_monitor_log*.csv*
+plc_monitor_config.json
+Claude outputs/
+_legacy/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

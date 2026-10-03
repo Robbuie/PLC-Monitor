@@ -1,0 +1,14 @@
+# Runtime dependencies. Every one ships inside the installer.
+PySide6>=6.7
+matplotlib>=3.7          # Trend and Latency charts
+psutil>=5.9              # Connections, adapter names
+
+# PLC drivers. Each is imported only when its PLC family is chosen, so a
+# missing one disables that family and nothing else.
+pycomm3>=1.2             # Rockwell ControlLogix / CompactLogix
+python-snap7>=1.3        # Siemens S7 (bundles snap7.dll)
+pymcprotocol>=0.3        # Mitsubishi MC Protocol
+# libplctag is not on PyPI: plctag.dll is fetched by Download on the Tags page.
+
+scapy>=2.5               # Passive sniff (also needs Npcap on the PC)
+pywin32>=306; sys_platform == "win32"   # the Windows service

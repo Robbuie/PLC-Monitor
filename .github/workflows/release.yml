@@ -1,0 +1,141 @@
+# Tag a version, get an installer.
+#
+#   (bump __version__ in app/__init__.py and pyproject.toml, and CHANGELOG.md)
+#   git tag v0.7.0 && git push --follow-tags
+#
+# `packaging/build.py` BUILDS: the frozen folder, the setup exe, and
+# latest.json -- the file every installed copy fetches to learn that a new
+# version exists. It does not publish them. `gh` does, in one call, at the end.
+#
+# That split is the lesson from Redline PDF, which let its packager publish
+# once per target: two of them raced to create the same release, the loser's
+# uploads were orphaned, and latest.yml -- uploaded last -- never arrived. The
+# run still exited 0, so the release looked fine and the fault only appeared
+# weeks later on a machine that could no longer update. Uploading explicitly
+# also means the asset list is something this file states rather than something
+# a publisher decides.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r packaging/requirements-build.txt
+          pip install pytest
+
+      # A tag that disagrees with app/__init__.py ships an installer whose
+      # version the updater will never match: the manifest would announce one
+      # number and the installed build would report another, so the prompt
+      # would come back on every launch forever. Fail here instead.
+      - name: Tag must match app/__init__.py
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          app="$(python -c "import re,io; print(re.search(r'__version__ = \"([^\"]+)\"', io.open('app/__init__.py', encoding='utf-8').read()).group(1))")"
+          if [ "$tag" != "$app" ]; then
+            echo "::error::tag $tag does not match __version__ $app"
+            exit 1
+          fi
+
+      - name: Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q
+
+      # Inno Setup 6 ships on the Windows runner image. Installing it here is
+      # for the day it does not, which is the sort of thing that changes
+      # without warning and would otherwise fail with a path error.
+      - name: Inno Setup
+        shell: bash
+        run: |
+          if [ ! -f "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup --no-progress -y
+          fi
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" /? | head -1 || true
+
+      - name: Build
+        run: python packaging/build.py
+
+      # build.py checks this too. It is repeated here because the manifest is
+      # the easiest thing in the release to lose silently, and because a check
+      # that only exists inside the thing being checked is not much of a check.
+      - name: Update metadata must exist and must name a real file
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/latest.json ]; then
+            echo "::error::packaging/build.py did not write dist/latest.json"
+            ls -la dist || true
+            exit 1
+          fi
+          cat dist/latest.json
+          name="$(python -c "import json; print(json.load(open('dist/latest.json'))['installer']['name'])")"
+          if [ ! -f "dist/$name" ]; then
+            echo "::error::latest.json names '$name', which is not in dist/"
+            ls -la dist
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: |
+            dist/PLCMonitor-Setup-*.exe
+            dist/latest.json
+
+      # The release page says what changed, taken from the entry that was
+      # written anyway rather than typed a second time. If the slice comes back
+      # empty -- a heading renamed, a version not in the file -- the release
+      # still goes out with the old one-liner, because a release that fails to
+      # publish over its own notes is a worse outcome than a thin release page.
+      - name: Release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          python - "$GITHUB_REF_NAME" <<'PY' > notes.md || true
+          import io, re, sys
+          version = sys.argv[1].lstrip("v")
+          text = io.open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(r"^## \[" + re.escape(version) + r"\].*?$(.*?)(?=^## \[|\Z)",
+                            text, re.S | re.M)
+          print((match.group(1).strip() if match else ""))
+          PY
+          if [ ! -s notes.md ]; then
+            echo "PLC Monitor ${GITHUB_REF_NAME#v} -- see CHANGELOG.md" > notes.md
+          fi
+          cat notes.md
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # A re-run of the same tag replaces the release rather than failing
+          # on it. The tag is left alone -- it is what triggered this run.
+          gh release delete "$GITHUB_REF_NAME" --yes || true
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/PLCMonitor-Setup-*.exe dist/latest.json

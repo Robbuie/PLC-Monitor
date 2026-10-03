@@ -1,0 +1,3 @@
+# Build-time only. None of this ships inside the installer.
+pyinstaller>=6.6
+pillow>=10.0

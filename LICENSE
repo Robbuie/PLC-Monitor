@@ -1,0 +1,39 @@
+Copyright (c) 2026 Robbuie. All rights reserved.
+
+This source code is published so that the tool it produces can be read, audited and downloaded.
+It is not open source. No licence is granted to copy, modify, distribute, sublicense, or create
+derivative works from it, in whole or in part, except as permitted below or by written permission
+from the copyright holder.
+
+Permitted without asking:
+
+  - Downloading and running the published builds, including on a customer's PC as part of work
+    done for that customer.
+  - Reading this source code, and quoting short excerpts of it when reporting a problem or
+    suggesting a change to this project.
+  - Forking this repository on GitHub for the sole purpose of proposing a change back to it.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+This tool connects to live industrial equipment. It only reads from PLCs, but it opens
+connections on plant networks; satisfy yourself about what a build does before pointing it at one.
+
+---
+
+Third-party components are used under their own licences:
+
+  - PySide6 / Qt               - LGPL-3.0
+  - matplotlib                 - matplotlib licence (BSD-style)
+  - psutil                     - BSD-3-Clause
+  - pycomm3                    - MIT
+  - python-snap7               - MIT (snap7 itself: LGPL-3.0)
+  - pymcprotocol               - MIT
+  - scapy                      - GPL-2.0 (Passive sniff)
+  - pywin32                    - PSF
+  - libplctag (plctag.dll, downloaded at run time, not shipped) - MPL-2.0 / LGPL-2.0
+
+The design system in app/theme is shared with the author's other applications.
