@@ -1,13 +1,111 @@
 # PLC Monitor
 
-Timestamps PLC tag changes and socket messages to the millisecond, in one log,
-so you can measure how long the downstream system takes to react. Built to
-answer one question -- *how many milliseconds between the PLC changing and the
-message going out?* -- and to keep answering it unattended as a Windows service.
+**How many milliseconds pass between the PLC changing and the other system
+reacting?** PLC Monitor answers that. It watches PLC tags and the network
+messages going to and from another system, writes every change and every
+message into one log with a millisecond timestamp, and then measures the gap
+between them -- once, or around the clock as a Windows service.
 
-It stands on its own: install it on a customer PC and nothing else is needed
-(Npcap only if you use Passive sniff). When NetControl or File Manager are also
-installed, PLC Monitor offers to hand work to them.
+It stands on its own: install it on any Windows PC on the machine network and
+nothing else is needed (Npcap only if you use Passive sniff). It never writes
+to a PLC.
+
+---
+
+## What it is for
+
+A typical case: a PLC sets `Part_Present` when a part arrives, and a vision
+system, MES, label printer or robot cell controller is supposed to answer over
+TCP. Someone says *"the camera is slow"* and someone else says *"the PLC is
+late"*. PLC Monitor puts both sides on one clock:
+
+```
+10:30:45.112  PLC_CHANGED  Part_Present   False -> True
+10:30:45.398  SOCK_RECV    10.0.40.50:9000 > 10.0.40.11:2000   "OK,PART=1234"
+                           -> 286 ms from tag change to answer
+```
+
+Leave it running for a shift and the **Latency** page tells you the fastest,
+typical and slowest answer, the 95th percentile, and how many times the answer
+never came.
+
+It is also useful on its own as:
+
+- a **tag logger** -- every value change of any tag, with old and new value;
+- a **trend viewer** for those tags, live or from last week's log -- and,
+  when RobControl is on the same PC, for robot registers and I/O alongside them;
+- a **socket sniffer / logger** that shows exactly what a device sent and when;
+- a **"what is on this port?"** tool (the Network page).
+
+## How it works, in one picture
+
+```
+  PLC  --(polled every N ms)-->  Tags page    \
+                                                >--  one CSV log  -->  Live log, Trend, Latency
+  other system <--(network)-->  Socket page   /
+```
+
+1. **Tags** reads the tags you list from the PLC every *Poll every* ms
+   (default 100). Only *changes* are logged, so a tag that sits still for an
+   hour costs nothing.
+2. **Socket** records messages between two devices -- by listening to the
+   network (Passive sniff, changes nothing) or by standing in the middle
+   (Proxy / Server / UDP).
+3. Both write to the same CSV, stamped by this PC's clock, so the two sides can
+   be compared directly.
+4. **Live log**, **Trend** and **Latency** read that CSV -- or any older one,
+   from this PC or another.
+
+## How accurate is it?
+
+- **Socket messages** are stamped when the PC sees them -- within a
+  millisecond or two.
+- **Tag changes** are stamped when the poll that saw them returns. The real
+  change happened some time during the last poll interval, so a tag-to-message
+  measurement can read up to one poll interval *short*. At the default 100 ms,
+  treat results as +/- 100 ms; for tighter numbers lower *Poll every* (and keep
+  the tag list short -- each poll reads every tag), or watch both sides on the
+  network instead of polling.
+- *Changes* only catches what a poll sees: a bit that goes on and off again
+  between two polls is never logged. If it matters, have the PLC latch it or
+  count it, and monitor the latch or counter.
+- Everything uses one PC clock, so comparing tags with messages is exact
+  in that sense. Comparing logs from **two different PCs** is only as good as
+  their clocks agree.
+
+---
+
+## Your first measurement, step by step
+
+You need: the PLC's IP address and type, the tag that starts the event, and
+the IP address (and ideally port) of the system that answers. This PC must be
+on the same network.
+
+1. **Tags page** (`Ctrl+1`). Pick the **PLC family**, type the **IP address**
+   (Rockwell: also the controller's **CPU slot**). Type a tag name in the box
+   above the table and press **Add**. Press **Connect** (`F5`). The *PLC* chip
+   in the title bar turns green and the value appears; toggle the tag at the
+   machine and watch it flash.
+2. **Socket page** (`Ctrl+2`). Choose **Passive sniff**, pick the network
+   adapter on the machine network, put the other system's address in
+   **Filter host** (and its port in **Filter port** if you know it), and this
+   PC's address in **Our IP**. Press **Start** (`F6`). If you have not
+   installed Npcap or are not running as administrator, the page says so and
+   offers **Restart as administrator**.
+3. **Live log** (`Ctrl+3`). Make the event happen. You should see a green
+   *PLC* row followed by a cyan *received* row. If only one side appears, see
+   *Troubleshooting* below.
+4. **Latency** (`Ctrl+5`). Under *Start the clock when*, choose the tag and,
+   if only one direction matters, put the value in *Changes to* (`True`).
+   Under *Stop it at the next*, choose a received message (narrow it with
+   *Containing* if the device sends other traffic). Press **Measure**.
+   **Export CSV** gives every pair for a report.
+5. Want it to keep measuring after you leave? Go to **Service** (`Ctrl+7`),
+   turn on **Unattended** on the Tags and Socket pages, then **Install** and
+   **Start**. Come back later and run step 4 on the log.
+
+`File > Save config` (`Ctrl+S`) keeps everything for next time; the service
+uses the same saved config.
 
 ---
 
@@ -95,8 +193,28 @@ Numeric tag values over time from the live log, an archive, or any PLC Monitor
 log opened with **Open file...** (a log from another PC works). Booleans plot
 as 0 and 1. **One per tag** gives each tag its own chart on a shared time axis,
 so tags with very different ranges stay readable; **Together** puts them on one
-axis. Hover a line for the exact time and value. Up to eight tags; each keeps
+axis. Hover a line for the exact time and value. Up to eight lines; each keeps
 its colour for the session. **Refresh every 30 s** turns it into a live display.
+
+**Robots.** When [RobControl](https://github.com/Robbuie/RobControl) (the
+FANUC robot tool from the same family) is installed on this PC and recording,
+the **Robots** card under the tag list shows every signal it records --
+registers, I/O, system variables -- named *robot / address* (`R2-14 / R[2]
+Weld count`). Tick them like tags: robot signals and PLC tags share the eight
+lines and the time axis, so a weld count or a cycle-time register can be read
+against the PLC tags that drive it.
+
+- PLC Monitor only reads RobControl's recording (read-only); it never talks to a
+  robot. Start and stop recording, and choose what to record, in RobControl's
+  Trends tab.
+- **Open...** on the card reads a `robcontrol.db` from another PC. Logs from two
+  PCs only line up as well as the two PCs' clocks agree.
+- RobControl reads a robot every 2 seconds at the fastest, so robot lines are
+  good for trends, not for millisecond timing. For robot I/O that the PLC
+  already exchanges with the robot (over EtherNet/IP, for example), monitor the
+  PLC tag instead: it is logged at the full poll rate and works on the Latency
+  page.
+- On a PC without RobControl the card is a single note and can be ignored.
 
 ### Latency
 
@@ -190,6 +308,20 @@ connection list shows what.
 page -- a monitor needs **Unattended** on. Then `service.log`, and Event Viewer
 under Windows Logs > Application.
 
+
+**Latency results come out in steps of the poll interval.** That is the
+polling showing through (see *How accurate is it?*). Lower *Poll every* on the
+Tags page, or shorten the tag list.
+
+**Many triggers show "no response".** Is *Give up after* long enough for the
+slowest real answer? Is the *Stop it at the next* side too narrow (wrong
+*Monitor*, wrong *Containing* text, or *Direction* set to Received when the
+answer was logged as Sent)? Try *Direction: Either* and a blank *Containing*
+first, then narrow it down.
+
+**Trend shows a tag as missing.** Only numeric and True/False values plot; a
+tag whose values are text appears in the Live log but not on the Trend page.
+
 ---
 
 ## Building from source
@@ -213,6 +345,15 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.1.0 -- 2026-10-05
+
+- Trend: a **Robots** card shows the signals RobControl records (registers,
+  I/O, system variables) and plots them on the same time axis as PLC tags. Read
+  from RobControl's database, read-only; **Open...** reads one from another PC.
+- User guide rewritten for someone new to the tool: what it is for, a worked
+  example, how it works, how accurate the timestamps are (and why the poll
+  interval matters), a step-by-step first measurement, and more troubleshooting.
 
 ### 1.0.1 -- 2026-10-02
 

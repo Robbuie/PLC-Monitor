@@ -12,6 +12,8 @@ it better:
     machine without it.
   * **File Manager** for the log folder, which is where somebody goes to copy
     a day's archives onto a stick.
+  * **RobControl** for FANUC robots. It records robot signals; the Trend page
+    reads that recording (engine/robdata.py) and never talks to a robot itself.
 
 Found through each installer's own uninstall key, the same way each
 application finds itself for its updater, rather than by guessing a path: the
@@ -42,6 +44,7 @@ class Sibling:
 
 NETCONTROL = Sibling("NetControl", "{B2934E15-79BE-411A-9305-543B01455706}", "NetControl.exe")
 FILE_MANAGER = Sibling("File Manager", "{8B4A17D2-3C61-4F0E-9E5B-2A7D6C914F83}", "FileManager.exe")
+ROBCONTROL = Sibling("RobControl", "{14514928-E3D0-4430-855C-E342EF8388C1}", "RobControl.exe")
 
 _cache: dict[str, str | None] = {}
 

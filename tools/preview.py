@@ -68,6 +68,38 @@ def demo_log(path: str, minutes: int = 50) -> None:
         out.writerows(rows)
 
 
+def demo_robots(path: str, minutes: int = 50) -> None:
+    """A RobControl database shaped like FleetSchema.cs, with two robots."""
+    import sqlite3
+    rnd = random.Random(11)
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE Robot (Id INTEGER PRIMARY KEY, Name TEXT NOT NULL, Address TEXT NOT NULL);
+        CREATE TABLE TrendSignal (Id INTEGER PRIMARY KEY, RobotId INTEGER NOT NULL,
+                                  Address TEXT NOT NULL, Label TEXT, CreatedUtc TEXT NOT NULL);
+        CREATE TABLE TrendSample (SignalId INTEGER NOT NULL, UtcMs INTEGER NOT NULL,
+                                  Value REAL NOT NULL);
+    """)
+    db.execute("INSERT INTO Robot VALUES (1, 'R2-14', '10.20.1.54'), (2, 'R2-15', '10.20.1.55')")
+    db.execute("INSERT INTO TrendSignal VALUES (1, 1, 'R[2]', 'Weld count', ''),"
+               " (2, 1, 'DI[1]', 'Part in nest', ''), (3, 2, '$TIMER[1].$TIMER_VAL', '', ''),"
+               " (4, 2, 'R[5]', 'Cycle time', '')")
+    start = int((time.time() - minutes * 60) * 1000)
+    rows, welds, nest = [], 18200, 0
+    for ms in range(start, start + minutes * 60_000, 2000):
+        if rnd.random() < 0.12:
+            welds += rnd.randint(4, 9)
+            rows.append((1, ms, welds))
+        if rnd.random() < 0.2:
+            nest = 1 - nest
+            rows.append((2, ms, nest))
+        if rnd.random() < 0.06:
+            rows.append((4, ms, round(rnd.uniform(38, 46), 1)))
+    db.executemany("INSERT INTO TrendSample VALUES (?, ?, ?)", rows)
+    db.commit()
+    db.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="previews")
@@ -84,7 +116,10 @@ def main() -> int:
     os.environ["LOCALAPPDATA"] = data
     os.makedirs(os.path.join(data, "logs"), exist_ok=True)
     demo_log(os.path.join(data, "logs", "plc_monitor_log.csv"))
+    os.makedirs(os.path.join(data, "RobControl"), exist_ok=True)
+    demo_robots(os.path.join(data, "RobControl", "robcontrol.db"))
 
+    from PySide6.QtCore import Qt
     from PySide6.QtWidgets import QApplication
     app = QApplication([])
     from app.core.settings import Settings
@@ -123,7 +158,17 @@ def main() -> int:
     trend.range.setCurrentIndex(trend.range.count() - 2)
     app.processEvents()
     trend._fill_tags(logdata.numeric_tags(rows))
-    trend._render(logdata.series(rows, ["Conveyor_Speed", "Oven_Temp"]), ["Conveyor_Speed", "Oven_Temp"],
+    from app.engine import robdata
+    db = robdata.default_db_path()
+    trend._fill_robots(db, robdata.signals(db), "")
+    robots = [s for s in robdata.signals(db) if s.address in ("R[2]", "DI[1]")]
+    for i in range(trend.robot_list.count()):
+        item = trend.robot_list.item(i)
+        if item.text() in [s.name for s in robots]:
+            item.setCheckState(Qt.Checked)
+    data = logdata.series(rows, ["Conveyor_Speed", "Part_Present"])
+    data.update(robdata.series(db, robots))
+    trend._render(data, ["Conveyor_Speed", "Part_Present"] + [s.name for s in robots],
                   "everything in the file")
     lat = window.pages["latency"]
     lat.trigger.set_choices(*logdata.sources(rows))

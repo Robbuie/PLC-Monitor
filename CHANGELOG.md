@@ -3,6 +3,15 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.1.0] - 2026-10-05
+
+- Trend: a Robots card shows the signals RobControl records (registers, I/O,
+  system variables) and plots them on the same time axis as PLC tags. Read from
+  RobControl's database, read-only; Open... reads one from another PC.
+- User guide rewritten for someone new to the tool: what it is for, a worked
+  example, how it works, how accurate the timestamps are (and why the poll
+  interval matters), a step-by-step first measurement, and more troubleshooting.
+
 ## [1.0.1] - 2026-10-02
 
 - Fixed: moving the mouse over the window printed an error on every move

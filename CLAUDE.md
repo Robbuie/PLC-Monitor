@@ -15,7 +15,7 @@ Viewer** (PyQt6) -- that is meant to read as one suite. The look is a spec, not
 a preference: see *The design system*.
 
 **It must stand alone.** It is installed on customer PCs that will never have
-NetControl or File Manager. Sibling integration (`app/core/siblings.py`) is
+NetControl, File Manager or RobControl. Sibling integration (`app/core/siblings.py`) is
 found at run time through the siblings' installer keys and every caller has a
 plain path for when they are absent.
 
@@ -44,6 +44,7 @@ app/
     monitors.py      THE way a config becomes a driver / socket monitor -- window and service both
     headless.py      the unattended runner (retries the PLC every 15 s)
     logdata.py       reading logs back: trend series, latency pairing
+    robdata.py       reading RobControl's trend recording (SQLite, read-only) for the Trend page
     network_discovery.py   connections, gentle port check, read-only PLC handshakes
   core/              no widgets. settings.py (ui.json), updates.py, themeswitch.py, siblings.py
   theme/             tokens.py (copied from File Manager), qss.py (copied), sheet.py (ours)
@@ -85,6 +86,9 @@ vision; a tag keeps its colour for the session; eight lines maximum.
 - Handshakes are reads (ListIdentity, COTP CR, MC read of D0). Nothing here
   writes to a PLC. Adding a write is a change to these rules first.
 - Passive sniff transmits nothing.
+- Robots are RobControl's: PLC Monitor reads RobControl's recording
+  (`robcontrol.db`, opened `mode=ro`) and never sends anything to a robot.
+  Faster robot reads belong in RobControl, under its own safety rules.
 
 ## Commands
 

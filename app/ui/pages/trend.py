@@ -8,6 +8,12 @@ a ninth line is a chart nobody can read, so the list says so instead.
 
 A log records changes, not samples, so each change is drawn as a step at the
 moment it happened (logdata.series keeps the old value as well as the new).
+
+Robot signals come from RobControl's own recording (engine/robdata.py), listed
+in a second card under the tags. They share the eight lines, the colours and
+the time axis with the PLC tags, so a register on a robot and a tag in the PLC
+can be read against each other. The card stays a single line on a PC without
+RobControl, which is most of the PCs this goes on.
 """
 
 from __future__ import annotations
@@ -29,7 +35,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.engine import logdata
+from app.core import siblings
+from app.engine import logdata, robdata
 from app.theme import sheet
 from app.theme.tokens import LIGHT_THEMES, SERIES_DARK, SERIES_LIGHT
 from app.ui import widgets as w
@@ -48,15 +55,18 @@ class TrendPage(Page):
     key = "trend"
     title = "Trend"
     glyph = "trend"
-    blurb = "Numeric tag values over time, from the live log or an archive."
+    blurb = "Tag values over time, from the live log or an archive, with RobControl's robot signals."
 
     _loaded = Signal(object, list, str)
     _tags_found = Signal(list)
+    _robots_found = Signal(str, list, str)
 
     def __init__(self, session, parent=None) -> None:
         super().__init__(session, parent)
         self._colours: dict[str, int] = {}
         self._extra_files: list[str] = []
+        self._robot_files: list[str] = []
+        self._signals: dict[str, robdata.RobotSignal] = {}
         self._lines = []
         self._loading = False
 
@@ -96,6 +106,9 @@ class TrendPage(Page):
         split.setChildrenCollapsible(False)
         split.setHandleWidth(10)
         self.body.addWidget(split, 1)
+        self.left = QSplitter(Qt.Vertical)
+        self.left.setChildrenCollapsible(False)
+        self.left.setHandleWidth(10)
 
         tags_card = w.Card("Tags")
         tags_card.add_action(w.button("All", "quiet", slot=lambda: self._tick_all(True)))
@@ -106,9 +119,31 @@ class TrendPage(Page):
         tags_card.body.addWidget(self.tag_list, 1)
         self.tag_note = w.label("", "hint", wrap=True)
         tags_card.body.addWidget(self.tag_note)
-        tags_card.setMinimumWidth(220)
-        tags_card.setMaximumWidth(320)
-        split.addWidget(tags_card)
+        self.left.addWidget(tags_card)
+
+        robots_card = w.Card("Robots")
+        robots_card.title.setToolTip("Signals recorded by RobControl. PLC Monitor reads the "
+                                     "recording; it never talks to a robot.")
+        robots_card.add_action(w.button("Open...", "quiet", slot=self._browse_robots,
+                                        tip="A robcontrol.db, for example one copied from "
+                                            "another PC. Opened read-only."))
+        robots_card.add_action(w.tool("refresh", "Read the signal list again", self.reload_robots))
+        self.robot_source = QComboBox()
+        self.robot_source.setToolTip("Which RobControl database to read.")
+        robots_card.body.addWidget(self.robot_source)
+        self.robot_list = QListWidget()
+        robots_card.body.addWidget(self.robot_list, 1)
+        self.robot_note = w.label("", "hint", wrap=True)
+        robots_card.body.addWidget(self.robot_note)
+        self.robot_open = w.button("Open RobControl", "quiet", icon_name="external",
+                                   slot=lambda: siblings.launch(siblings.ROBCONTROL))
+        robots_card.body.addWidget(self.robot_open)
+        self.left.addWidget(robots_card)
+        self.robots_card = robots_card
+
+        self.left.setMinimumWidth(220)
+        self.left.setMaximumWidth(340)
+        split.addWidget(self.left)
 
         chart_card = w.Card("Chart")
         self.chart_status = w.label("", "hint")
@@ -136,14 +171,18 @@ class TrendPage(Page):
             lambda: self.between.setVisible(self.range.currentData() == -1))
         self.source.currentIndexChanged.connect(lambda _i: self.reload_tags())
         self.tag_list.itemChanged.connect(self._ticked)
+        self.robot_list.itemChanged.connect(self._ticked)
+        self.robot_source.currentIndexChanged.connect(lambda _i: self.reload_robots())
         self._loaded.connect(self._render)
         self._tags_found.connect(self._fill_tags)
+        self._robots_found.connect(self._fill_robots)
         self._timer = QTimer(self)
         self._timer.setInterval(30_000)
         self._timer.timeout.connect(self.plot)
         self.auto.toggled.connect(lambda on: self._timer.start() if on else self._timer.stop())
         session.logPathChanged.connect(lambda _p: self.refresh_sources())
         self.refresh_sources()
+        self.refresh_robot_sources()
 
     # ------------------------------------------------------------- chart
 
@@ -271,6 +310,124 @@ class TrendPage(Page):
         if not tags:
             self.tag_note.setText("No numeric tag changes in this file yet.")
 
+    # ------------------------------------------------------------ robots
+
+    def refresh_robot_sources(self) -> None:
+        """RobControl's database on this PC first, then any opened by hand."""
+        current = self.robot_source.currentData()
+        paths = []
+        found = robdata.default_db_path()
+        if found:
+            paths.append(found)
+        paths += [p for p in self._robot_files if p not in paths]
+        self.robot_source.blockSignals(True)
+        self.robot_source.clear()
+        for path in paths:
+            text = "RobControl on this PC" if path == found else os.path.basename(path)
+            self.robot_source.addItem(text, path)
+            self.robot_source.setItemData(self.robot_source.count() - 1, path, Qt.ToolTipRole)
+        index = self.robot_source.findData(current)
+        self.robot_source.setCurrentIndex(max(0, index))
+        self.robot_source.blockSignals(False)
+        self.robot_source.setVisible(len(paths) > 1)
+        self.reload_robots()
+
+    def _browse_robots(self) -> None:
+        start = os.path.dirname(robdata.default_db_path() or "") or os.path.expanduser("~")
+        path, _ = QFileDialog.getOpenFileName(self, "Open a RobControl database", start,
+                                              "RobControl database (*.db);;All files (*)")
+        if path:
+            if path not in self._robot_files:
+                self._robot_files.append(path)
+            self.refresh_robot_sources()
+            self.robot_source.setCurrentIndex(self.robot_source.findData(path))
+
+    def add_robot_database(self, path: str) -> None:
+        """Read robot signals from `path` as well. For tools/preview.py and tests."""
+        if path not in self._robot_files:
+            self._robot_files.append(path)
+        self.refresh_robot_sources()
+        self.robot_source.setCurrentIndex(self.robot_source.findData(path))
+
+    def reload_robots(self) -> None:
+        path = self.robot_source.currentData()
+        if not path:
+            self._fill_robots("", [], "")
+            return
+        self.robot_note.setText("Reading the robot signals...")
+
+        def work():
+            try:
+                found, error = robdata.signals(path), ""
+            except robdata.RobDataError as exc:
+                found, error = [], str(exc)
+            self._robots_found.emit(path, found, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _fill_robots(self, path: str, found: list, error: str) -> None:
+        if path and path != self.robot_source.currentData():
+            return  # an older read finishing after the source changed
+        ticked = {key for key in self._ticked_robot_keys()}
+        self._signals = {signal.key: signal for signal in found}
+        self.robot_list.blockSignals(True)
+        self.robot_list.clear()
+        for signal in found:
+            item = QListWidgetItem(signal.name)
+            item.setData(Qt.UserRole, signal.key)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if signal.key in ticked else Qt.Unchecked)
+            if signal.last_ms is None:
+                item.setToolTip("Never recorded yet.")
+            else:
+                last = datetime.fromtimestamp(signal.last_ms / 1000)
+                item.setToolTip(f"Last sample {last:%Y-%m-%d %H:%M:%S}")
+            self.robot_list.addItem(item)
+        self.robot_list.blockSignals(False)
+        installed = siblings.location(siblings.ROBCONTROL) is not None
+        self.robot_list.setVisible(bool(found))
+        self.robot_open.setVisible(installed and not found)
+        if error:
+            self.robot_note.setText(error)
+            w.set_prop(self.robot_note, "tone", "warn")
+        elif not path:
+            self.robot_note.setText(
+                "RobControl records robot registers, I/O and system variables; its recording "
+                "shows here. None on this PC" + (" yet." if installed else
+                                                 ". Open... reads a robcontrol.db from another PC."))
+            w.set_prop(self.robot_note, "tone", "")
+        elif not found:
+            self.robot_note.setText("No signals in this recording. Add some on a robot's "
+                                    "Trends tab in RobControl and start recording.")
+            w.set_prop(self.robot_note, "tone", "")
+        else:
+            w.set_prop(self.robot_note, "tone", "")
+        # A PC without RobControl gets a short card, not half the column.
+        if found:
+            self.robots_card.setMaximumHeight(16777215)
+            self.left.setSizes([3, 2])
+        else:
+            QTimer.singleShot(0, self._fit_robots_card)
+        self._ticked()
+
+    def _fit_robots_card(self) -> None:
+        """Shrink the card to its header and note. Measured once laid out,
+        because the note wraps and its height depends on the column width."""
+        if self.robot_list.count():
+            return
+        card = self.robots_card
+        layout = card.layout()
+        layout.activate()
+        height = layout.totalHeightForWidth(max(card.width(), 220))
+        card.setMaximumHeight(max(height, layout.totalMinimumSize().height()))
+
+    def _ticked_robot_keys(self) -> list[str]:
+        return [self.robot_list.item(i).data(Qt.UserRole) for i in range(self.robot_list.count())
+                if self.robot_list.item(i).checkState() == Qt.Checked]
+
+    def _selected_robots(self) -> list:
+        return [self._signals[k] for k in self._ticked_robot_keys() if k in self._signals]
+
     def _tick_all(self, on: bool) -> None:
         self.tag_list.blockSignals(True)
         for i in range(self.tag_list.count()):
@@ -284,14 +441,18 @@ class TrendPage(Page):
 
     def _ticked(self, *_):
         n = len(self._selected())
+        robots = len(self._ticked_robot_keys())
         total = self.tag_list.count()
-        if n > MAX_LINES:
-            self.tag_note.setText(f"{n} ticked. The chart draws {MAX_LINES} at most; "
-                                  "untick some to choose which.")
+        if n + robots > MAX_LINES:
+            self.tag_note.setText(f"{n + robots} ticked, tags and robots together. The chart "
+                                  f"draws {MAX_LINES} at most; untick some to choose which.")
             w.set_prop(self.tag_note, "tone", "warn")
         else:
             self.tag_note.setText(f"{n} of {total} ticked. Booleans plot as 0 and 1.")
             w.set_prop(self.tag_note, "tone", "")
+        if self.robot_list.count() and self.robot_note.property("tone") != "warn":
+            self.robot_note.setText(f"{robots} of {self.robot_list.count()} ticked. RobControl "
+                                    "reads a robot every 2 s at the fastest.")
 
     # -------------------------------------------------------------- plot
 
@@ -310,27 +471,42 @@ class TrendPage(Page):
         if self.figure is None or self._loading:
             return
         tags = self._selected()[:MAX_LINES]
-        if not tags:
-            self._empty("Tick at least one tag.")
+        robots = self._selected_robots()[:MAX_LINES - len(tags)]
+        if not tags and not robots:
+            self._empty("Tick at least one tag or robot signal.")
             return
         path = self.source.currentData()
+        db = self.robot_source.currentData()
         start, end, label = self._window()
+        names = tags + [signal.name for signal in robots]
         self._loading = True
         self.chart_status.setText("Loading...")
 
         def work():
-            try:
-                data = logdata.series(logdata.read_rows(path), tags, start, end)
-            except OSError as exc:
-                data = {"__error__": str(exc)}
-            self._loaded.emit(data, tags, label)
+            data: dict = {}
+            if tags:
+                try:
+                    data.update(logdata.series(logdata.read_rows(path), tags, start, end))
+                except OSError as exc:
+                    data["__error__"] = str(exc)
+            if robots:
+                try:
+                    data.update(robdata.series(db, robots, start, end))
+                except robdata.RobDataError as exc:
+                    data["__robot_error__"] = str(exc)
+            self._loaded.emit(data, names, label)
 
         threading.Thread(target=work, daemon=True).start()
 
     def _render(self, data: dict, tags: list[str], label: str) -> None:
         self._loading = False
+        problems = []
         if "__error__" in data:
-            self._empty(f"Could not read the file: {data['__error__']}")
+            problems.append(f"Could not read the log: {data['__error__']}")
+        if "__robot_error__" in data:
+            problems.append(f"Could not read the robots: {data['__robot_error__']}")
+        if problems and not any(data.get(tag, ([], []))[0] for tag in tags):
+            self._empty("\n".join(problems))
             self.chart_status.setText("")
             return
         import matplotlib.dates as mdates
@@ -339,7 +515,7 @@ class TrendPage(Page):
         present = [tag for tag in tags if data.get(tag, ([], []))[0]]
         self._lines = []
         if not present:
-            self._empty(f"No changes for these tags in {label}.")
+            self._empty(f"No values for these in {label}.")
             self.chart_status.setText("")
             return
         stacked = self.arrange.value() == "stacked" and len(present) > 1
@@ -385,8 +561,9 @@ class TrendPage(Page):
         self._tip = None
         self.canvas.draw_idle()
         n = len(self._lines)
-        self.chart_status.setText(f"{n} tag{'s' if n != 1 else ''}, {points:,} points, {label}"
-                                  f"  |  updated {time.strftime('%H:%M:%S')}")
+        self.chart_status.setText(f"{n} line{'s' if n != 1 else ''}, {points:,} points, {label}"
+                                  f"  |  updated {time.strftime('%H:%M:%S')}"
+                                  + ("  |  " + problems[0] if problems else ""))
 
     def _hover(self, event) -> None:
         """Nearest point under the pointer, as a small label: tag, time, value."""
@@ -450,6 +627,10 @@ class TrendPage(Page):
     def shown(self) -> None:
         if self.source.count() and self.source.itemData(0) != self.session.logger.log_path:
             self.refresh_sources()
+        QTimer.singleShot(0, self._fit_robots_card)
+        # RobControl may have been installed, or started recording, since.
+        if robdata.default_db_path() and self.robot_source.findData(robdata.default_db_path()) < 0:
+            self.refresh_robot_sources()
 
     def theme_changed(self) -> None:
         super().theme_changed()
