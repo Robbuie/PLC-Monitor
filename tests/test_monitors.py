@@ -11,12 +11,35 @@ from app.engine.event_log import EventLogger
 from app.engine.monitors import build_socket_monitor
 
 
-def free_port():
-    s = socket.socket()
+def free_port(kind=socket.SOCK_STREAM):
+    # Free for the protocol the test will use: a TCP port that is free can be
+    # a UDP port something else holds (Windows runners keep many open).
+    s = socket.socket(socket.AF_INET, kind)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def wait_for(path, predicate, send=None, timeout=10.0):
+    """Rows of the log at `path` once one matches, sending again meanwhile.
+
+    A fixed sleep before sending raced the monitor's start on a slow CI
+    runner: a datagram sent before the bind is simply gone.
+    """
+    deadline = time.monotonic() + timeout
+    rows = []
+    while time.monotonic() < deadline:
+        if send is not None:
+            send()
+        time.sleep(0.2)
+        try:
+            rows = list(logdata.read_rows(str(path)))
+        except OSError:
+            rows = []
+        if any(predicate(r) for r in rows):
+            return rows
+    return rows
 
 
 def test_server_mode_logs_what_arrives(tmp_path):
@@ -26,10 +49,19 @@ def test_server_mode_logs_what_arrives(tmp_path):
     monitor = build_socket_monitor({"mode": "server", "listen_host": "127.0.0.1",
                                     "listen_port": port, "source_label": "T"}, logger)
     monitor.start()
-    time.sleep(0.3)
-    with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+    # Connect once the listener is up rather than after a guessed sleep.
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            client = socket.create_connection(("127.0.0.1", port), timeout=2)
+            break
+        except OSError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
+    with client:
         client.sendall(b"PART;00001;OK")
-        time.sleep(0.4)
+        rows = wait_for(log, lambda r: r["event_type"] == "SOCK_RECV" and "PART" in r["notes"])
     monitor.stop()
     logger.flush()
     rows = list(logdata.read_rows(str(log)))
@@ -38,7 +70,7 @@ def test_server_mode_logs_what_arrives(tmp_path):
 
 def test_headless_runs_the_enabled_socket_monitor_and_stops(tmp_path):
     from app.engine.headless import run
-    port = free_port()
+    port = free_port(socket.SOCK_DGRAM)
     cfg = ConfigManager(str(tmp_path / "cfg.json"))
     cfg.set("logging", "log_path", str(tmp_path / "h.csv"))
     cfg.set("socket", "enabled", True)
@@ -49,12 +81,33 @@ def test_headless_runs_the_enabled_socket_monitor_and_stops(tmp_path):
     stop = threading.Event()
     thread = threading.Thread(target=run, args=(cfg.path, stop))
     thread.start()
-    time.sleep(0.6)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-        udp.sendto(b"hello", ("127.0.0.1", port))
-    time.sleep(0.5)
-    stop.set()
-    thread.join(5)
+
+    def send():
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.sendto(b"hello", ("127.0.0.1", port))
+
+    try:
+        rows = wait_for(tmp_path / "h.csv", lambda r: r["event_type"] == "SOCK_RECV", send)
+    finally:
+        stop.set()
+        thread.join(10)
     assert not thread.is_alive()
-    rows = list(logdata.read_rows(str(tmp_path / "h.csv")))
-    assert any(r["event_type"] == "SOCK_RECV" for r in rows)
+    assert any(r["event_type"] == "SOCK_RECV" for r in rows), [
+        (r["event_type"], r["notes"]) for r in rows]
+
+
+def test_a_udp_port_already_taken_is_logged(tmp_path):
+    holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    log = tmp_path / "log.csv"
+    logger = EventLogger(str(log))
+    monitor = build_socket_monitor({"mode": "udp", "listen_host": "127.0.0.1",
+                                    "listen_port": port, "source_label": "U"}, logger)
+    try:
+        monitor.start()
+        rows = wait_for(log, lambda r: r["event_type"] == "SOCK_ERROR")
+    finally:
+        monitor.stop()
+        holder.close()
+    assert any("Bind error" in r["notes"] for r in rows if r["event_type"] == "SOCK_ERROR")

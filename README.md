@@ -421,6 +421,15 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 
 ## Changelog
 
+### 1.4.1 -- 2026-11-10
+
+- Fixed: a UDP listener whose port was already taken said so only on the
+  status line; the error now goes into the log, as it does for Proxy and
+  Server. A Windows "port unreachable" report no longer stops the listener.
+- Tests: the socket-monitor tests wait for the listener instead of sleeping
+  a fixed time, and pick a port free for UDP, which failed the 1.4.0 build
+  on a busy Windows runner.
+
 ### 1.4.0 -- 2026-11-09
 
 Profiles: one saved setup per site, line or PLC.

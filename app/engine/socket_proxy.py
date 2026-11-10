@@ -269,6 +269,11 @@ class UDPMonitor(SocketMonitorBase):
                 self._status(f"[UDP] Listening on {self.listen_host}:{self.listen_port}")
             except Exception as e:
                 self._status(f"[UDP] Bind error: {e}")
+                # Into the log as well, like Proxy and Server: under the
+                # service the status line goes nowhere a person looks, and a
+                # port already taken left a monitor that silently heard nothing.
+                self.logger.log(EV_SOCK_ERROR, self.source_label,
+                                notes=f"Bind error on {self.listen_host}:{self.listen_port}: {e}")
                 return
 
             while not self._stop_event.is_set():
@@ -279,6 +284,11 @@ class UDPMonitor(SocketMonitorBase):
                                     raw_data=data,
                                     notes=f"{len(data)} bytes | {self._try_decode(data)[:120]}")
                 except socket.timeout:
+                    continue
+                except ConnectionResetError:
+                    # Windows reports an ICMP "port unreachable" as WSAECONNRESET
+                    # on the next recvfrom of a UDP socket. It says nothing about
+                    # this socket's ability to receive; carry on listening.
                     continue
                 except Exception as e:
                     if not self._stop_event.is_set():
