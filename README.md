@@ -421,6 +421,14 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 
 ## Changelog
 
+### 1.4.2 -- 2026-11-10
+
+- Fixed: the Trend and Latency charts were missing from the installed build
+  ("matplotlib is not available in this build ... No module named
+  'unittest'"). The installer left out a standard module that matplotlib
+  needs. A test now checks that nothing the app imports depends on a module
+  the installer leaves out.
+
 ### 1.4.1 -- 2026-11-10
 
 - Fixed: a UDP listener whose port was already taken said so only on the

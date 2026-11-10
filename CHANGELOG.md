@@ -3,6 +3,14 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.4.2] - 2026-11-10
+
+- Fixed: the Trend and Latency charts were missing from the installed build
+  ("matplotlib is not available in this build ... No module named
+  'unittest'"). The installer left out a standard module that matplotlib
+  needs. A test now checks that nothing the app imports depends on a module
+  the installer leaves out.
+
 ## [1.4.1] - 2026-11-10
 
 - Fixed: a UDP listener whose port was already taken said so only on the

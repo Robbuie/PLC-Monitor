@@ -67,7 +67,11 @@ hidden = scapy_hidden + [
 ]
 
 EXCLUDE = [
-    "tkinter", "customtkinter", "pytest", "_pytest", "unittest", "pydoc",
+    # Not "unittest": pyparsing imports it when it loads, and matplotlib loads
+    # pyparsing, so excluding it took the Trend and Latency charts out of the
+    # build ("No module named 'unittest'"). tests/test_packaging.py checks
+    # every runtime import still works with this list taken away.
+    "tkinter", "customtkinter", "pytest", "_pytest", "pydoc",
     "PySide6.Qt3DAnimation", "PySide6.Qt3DCore", "PySide6.Qt3DExtras", "PySide6.Qt3DInput",
     "PySide6.Qt3DLogic", "PySide6.Qt3DRender", "PySide6.QtBluetooth", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtDesigner", "PySide6.QtHelp",
