@@ -36,6 +36,10 @@ def _console_for_frozen_gui() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Tell the installer this copy is running, so an update waits for it
+    # instead of replacing files underneath it (see app/instance.py).
+    from app.instance import hold_running_mutex
+    hold_running_mutex()
     if argv[:1] == ["service"]:
         from app import service
         return service.host()

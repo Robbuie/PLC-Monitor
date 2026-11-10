@@ -3,6 +3,19 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.5.2] - 2026-11-10
+
+- Fixed: an update could leave PLC Monitor unable to start ("Failed to start
+  embedded python interpreter!"). The installer removed the old program files
+  first and then failed to copy the new ones over a copy that was still
+  running. Now every running copy -- window, headless runner, service --
+  announces itself, and the installer waits up to 30 s for them to close,
+  or stops before changing anything and says what is still running.
+- When an update is ready and the service is running, the window says to
+  stop the service first.
+- Each update writes a log beside the downloaded installer
+  (`%LOCALAPPDATA%\PLC Monitor\updates`), and setup always logs to `%TEMP%`.
+
 ## [1.5.1] - 2026-11-10
 
 - Fixed: the Mitsubishi simulator in `tools/` crashed at start on Windows

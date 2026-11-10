@@ -57,6 +57,10 @@ Compression=lzma2/max
 SolidCompression=yes
 CloseApplications=yes
 RestartApplications=no
+; A log in %TEMP% ("Setup Log yyyy-mm-dd #nnn.txt") for every run, and the
+; updater asks for one beside the staged installer: an update that fails
+; silently can then be read rather than guessed at.
+SetupLogging=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -85,6 +89,42 @@ Filename: "{app}\{#AppExe}"; Description: "Start {#AppName}"; Flags: nowait post
 ; does nothing and the Service page's Remove is the way.
 Filename: "{sys}\sc.exe"; Parameters: "stop PLCMonitorService"; Flags: runhidden; RunOnceId: "StopService"
 Filename: "{sys}\sc.exe"; Parameters: "delete PLCMonitorService"; Flags: runhidden; RunOnceId: "DeleteService"
+
+[Code]
+{ Every running copy of PLC Monitor -- the window, a headless runner, the
+  Windows service -- holds one of these mutexes (app/instance.py).
+
+  [InstallDelete] removes the old _internal folder before the new files are
+  copied. If a running copy still has files open, the copy fails half way and
+  leaves a program that cannot start ("Failed to start embedded python
+  interpreter!" -- 1.5.1 on a PC where that happened). So nothing is touched
+  until no copy is running: the window that launched this update is usually
+  gone within a second or two, and this waits up to 30 s for it. A service
+  does not go away by itself; then setup stops, having changed nothing, and
+  says what to do. }
+const
+  RunningMutexes = 'PLCMonitorRunning,Global\PLCMonitorRunning';
+
+function InitializeSetup(): Boolean;
+var
+  Waited: Integer;
+begin
+  Waited := 0;
+  while CheckForMutexes(RunningMutexes) and (Waited < 60) do
+  begin
+    Sleep(500);
+    Waited := Waited + 1;
+  end;
+  Result := not CheckForMutexes(RunningMutexes);
+  if not Result then
+  begin
+    Log('PLC Monitor is still running; setup stopped before changing anything.');
+    SuppressibleMsgBox('PLC Monitor is still running: its window, a headless runner, ' +
+      'or the Windows service.' + #13#10#13#10 +
+      'Close it -- for the service, Stop on the Service page -- and run setup again. ' +
+      'Nothing has been changed.', mbError, MB_OK, IDOK);
+  end;
+end;
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\PLC Monitor\updates"

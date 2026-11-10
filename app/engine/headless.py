@@ -38,6 +38,10 @@ def _configure_logging() -> None:
 def run(config_path: str | None = None, stop_event: threading.Event | None = None) -> int:
     """Run until `stop_event` is set (or Ctrl-C). Returns a process exit code."""
     _configure_logging()
+    # Also here, not only in __main__: from source the service is hosted by
+    # pythonservice.exe, which never runs app.__main__.
+    from app.instance import hold_running_mutex
+    hold_running_mutex()
     from app import paths
     from app.engine.config_manager import ConfigManager
     from app.engine.event_log import EV_INFO, EV_PLC_ERROR, EventLogger

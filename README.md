@@ -130,6 +130,16 @@ if the PC has no internet).
   has a *Restart as administrator* button.
 - **libplctag** needs `plctag.dll`: press **Download** on the Tags page.
 
+**Updates** download in the background and install when you close the window.
+The installer waits for every running copy of PLC Monitor to close first --
+including the Windows service, so stop the service on the Service page before
+closing the window, and start it again afterwards. If PLC Monitor ever will
+not start after an update ("Failed to start embedded python interpreter!"),
+download the installer from the
+[releases page](https://github.com/Robbuie/plc-monitor/releases) and run it
+with PLC Monitor and its service stopped; your profiles and logs are not in
+the program folder and are not touched.
+
 The profiles and the logs live in `C:\ProgramData\PLC Monitor\`, shared by
 the window and the service. Uninstalling leaves them there.
 
@@ -472,6 +482,19 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.5.2 -- 2026-11-10
+
+- Fixed: an update could leave PLC Monitor unable to start ("Failed to start
+  embedded python interpreter!"). The installer removed the old program files
+  first and then failed to copy the new ones over a copy that was still
+  running. Now every running copy -- window, headless runner, service --
+  announces itself, and the installer waits up to 30 s for them to close,
+  or stops before changing anything and says what is still running.
+- When an update is ready and the service is running, the window says to
+  stop the service first.
+- Each update writes a log beside the downloaded installer
+  (`%LOCALAPPDATA%\PLC Monitor\updates`), and setup always logs to `%TEMP%`.
 
 ### 1.5.1 -- 2026-11-10
 

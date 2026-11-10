@@ -650,4 +650,13 @@ class MainWindow(QMainWindow):
         if self._progress is not None:
             self._progress.close()
             self._progress = None
-        w.info(self, "Update ready", f"PLC Monitor {release.version} installs when you close this window.")
+        detail = ""
+        if self.session.service == "RUNNING":
+            # The service runs this same program; the installer will not
+            # replace files under it (app/instance.py), so say so now rather
+            # than have the update quietly not happen.
+            detail = ("The PLC Monitor service is running. Stop it on the Service page "
+                      "before you close this window, or the update waits and then gives up; "
+                      "start the service again afterwards.")
+        w.info(self, "Update ready",
+               f"PLC Monitor {release.version} installs when you close this window.", detail)

@@ -432,8 +432,10 @@ def launch(installer: str) -> bool:
         flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
                 getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     try:
+        # The log beside the installer: if an update ever fails, it says why.
+        log = os.path.splitext(installer)[0] + ".log"
         subprocess.Popen(  # noqa: S603 - our own file, in our own folder
-            [installer, "/SILENT", "/NORESTART", "/SUPPRESSMSGBOXES"],
+            [installer, "/SILENT", "/NORESTART", "/SUPPRESSMSGBOXES", f"/LOG={log}"],
             creationflags=flags, close_fds=True,
         )
         return True
