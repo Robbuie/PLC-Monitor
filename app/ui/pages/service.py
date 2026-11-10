@@ -15,10 +15,12 @@ import sys
 import threading
 
 from PySide6.QtCore import QTimer, Signal
-from PySide6.QtWidgets import QPlainTextEdit
+from PySide6.QtWidgets import QComboBox, QPlainTextEdit
 
 from app import paths
 from app import service as svc
+from app.engine import profiles
+from app.engine.config_manager import ConfigManager
 from app.engine.monitors import describe_socket, tags_for
 from app.ui import widgets as w
 from app.ui.pages.base import Page
@@ -61,13 +63,21 @@ class ServicePage(Page):
         top.addWidget(status, 1)
 
         plan = w.Card("What it will run")
+        self.profile_box = QComboBox()
+        self.profile_box.setToolTip("The profile the service runs. Changing it takes effect the "
+                                    "next time the service starts.")
+        self.profile_box.activated.connect(self._profile_picked)
+        plan.body.addLayout(w.row(w.label("Profile", "fieldlabel"), self.profile_box,
+                                  stretch_at=1))
+        self.profile_note = w.label("", "hint", wrap=True)
+        plan.body.addWidget(self.profile_note)
         self.plan_plc = w.label("", wrap=True)
         self.plan_sock = w.label("", wrap=True)
         plan.body.addWidget(self.plan_plc)
         plan.body.addWidget(self.plan_sock)
         plan.body.addWidget(w.label("Change these with the Unattended switch on the Tags and Socket "
-                                    "pages. Save, then restart the service to pick up a change.",
-                                    "hint", wrap=True))
+                                    "pages of that profile. Save, then restart the service to "
+                                    "pick up a change.", "hint", wrap=True))
         plan.body.addLayout(w.row(w.button("Save config", "primary", slot=self._save), None))
         plan.body.addStretch(1)
         top.addWidget(plan, 1)
@@ -100,6 +110,7 @@ class ServicePage(Page):
         self._result.connect(self._finished)
         self._state.connect(self._show_state)
         session.configSaved.connect(self._describe)
+        session.profileDetails.connect(self._describe)
         self._timer = QTimer(self)
         self._timer.setInterval(10_000)
         self._timer.timeout.connect(self.refresh)
@@ -135,13 +146,58 @@ class ServicePage(Page):
         self.admin_note.setText("" if svc.is_admin() or not windows else
                                 "Each button asks Windows for administrator rights once.")
 
+    def _service_config(self):
+        """(config, profile) the service will run: the window's own config
+        object when it is the same profile -- so unsaved edits show -- or a
+        fresh read of the other profile's file."""
+        current = self.session.profile
+        target = profiles.get(profiles.service_profile_id())
+        if target is None or (current is not None and current.id == target.id):
+            return self.session.cfg, current
+        return ConfigManager(target.path), target
+
+    def _fill_profiles(self) -> None:
+        box = self.profile_box
+        box.blockSignals(True)
+        box.clear()
+        service_id = profiles.service_profile_id()
+        for p in profiles.list_profiles():
+            box.addItem(p.label + (f"  ({p.line})" if p.line else ""), p.id)
+        index = box.findData(service_id)
+        if index < 0:
+            box.insertItem(0, "Not chosen yet -- Install picks the open profile", None)
+            index = 0
+        box.setCurrentIndex(index)
+        box.blockSignals(False)
+
+    def _profile_picked(self, index: int) -> None:
+        pid = self.profile_box.itemData(index)
+        if not pid:
+            return
+        try:
+            profiles.set_service_profile(pid)
+        except (profiles.ProfileError, OSError) as exc:
+            w.error(self, "Service", "Could not choose that profile.", str(exc))
+        self.session.profileDetails.emit()  # the title bar marks the service's profile
+
     def _describe(self) -> None:
-        c = self.session.cfg
+        self._fill_profiles()
+        c, target = self._service_config()
+        current = self.session.profile
+        notes = []
+        if target is not None and current is not None and target.id != current.id:
+            notes.append(f"This window has {current.label} open; the service runs "
+                         f"{target.label}.")
+        if self.session.service == "RUNNING":
+            notes.append("A change of profile takes effect when the service is restarted.")
+        self.profile_note.setText(" ".join(notes))
+        self.profile_note.setVisible(bool(notes))
         tags = tags_for(c.plc)
         if c.plc.get("enabled") and tags:
             self.plan_plc.setText(f"Poll {len(tags)} tag{'s' if len(tags) != 1 else ''} on "
                                   f"{c.plc.get('type')} at {c.plc.get('ip')} every "
-                                  f"{c.plc.get('poll_ms')} ms, retrying every 15 s if it does not answer.")
+                                  f"{c.plc.get('poll_ms')} ms, retrying every 15 s if it does not "
+                                  "answer and reconnecting by itself if it goes away.")
             w.set_prop(self.plan_plc, "tone", "")
         elif c.plc.get("enabled"):
             self.plan_plc.setText("PLC polling is on, but there are no tags for the chosen PLC.")
@@ -179,7 +235,12 @@ class ServicePage(Page):
 
     def _install(self) -> None:
         self._save()
-        if not (self.session.cfg.plc.get("enabled") or self.session.cfg.socket.get("enabled")):
+        current = self.session.profile
+        if profiles.get(profiles.service_profile_id()) is None and current is not None:
+            profiles.set_service_profile(current.id)
+            self._describe()
+        c, _target = self._service_config()
+        if not (c.plc.get("enabled") or c.socket.get("enabled")):
             if not w.ask(self, "Install service", "Neither monitor is set to run unattended.",
                          "The service would start and log nothing. Turn on Unattended on the "
                          "Tags or Socket page first, or install anyway.", yes="Install anyway"):
@@ -193,10 +254,12 @@ class ServicePage(Page):
 
     def _headless(self) -> None:
         self._save()
+        # The open profile, which is what the person has been testing here --
+        # not necessarily the service's.
         if getattr(sys, "frozen", False):
-            command = [sys.executable, "headless"]
+            command = [sys.executable, "headless", "--config", self.session.cfg.path]
         else:
-            command = [sys.executable, "-m", "app", "headless"]
+            command = [sys.executable, "-m", "app", "headless", "--config", self.session.cfg.path]
         flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         try:
             subprocess.Popen(command, creationflags=flags, cwd=paths.program_folder())
@@ -207,3 +270,6 @@ class ServicePage(Page):
     def shown(self) -> None:
         self._describe()
         self.refresh()
+
+    def profile_changed(self) -> None:
+        self._describe()

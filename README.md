@@ -114,8 +114,8 @@ on the same network.
    turn on **Unattended** on the Tags and Socket pages, then **Install** and
    **Start**. Come back later and run step 4 on the log.
 
-`File > Save config` (`Ctrl+S`) keeps everything for next time; the service
-uses the same saved config.
+`File > Save config` (`Ctrl+S`) keeps everything for next time, in the open
+**profile** (see below); the service runs a saved profile too.
 
 ---
 
@@ -130,8 +130,8 @@ if the PC has no internet).
   has a *Restart as administrator* button.
 - **libplctag** needs `plctag.dll`: press **Download** on the Tags page.
 
-The configuration and the logs live in `C:\ProgramData\PLC Monitor\`, shared
-by the window and the service. Uninstalling leaves them there.
+The profiles and the logs live in `C:\ProgramData\PLC Monitor\`, shared by
+the window and the service. Uninstalling leaves them there.
 
 ---
 
@@ -143,8 +143,44 @@ holds the menus and two chips -- *PLC* and *Socket* -- that turn green while
 they are running, and a third while the service is logging in the background.
 
 Keyboard: `F5` connect the PLC, `F6` start the socket monitor, `Ctrl+.` stop
-both, `Ctrl+1`...`Ctrl+7` jump to a page, `Ctrl+S` save the config, `F1` this
-guide.
+both, `Ctrl+1`...`Ctrl+7` jump to a page, `Ctrl+S` save the config, `Ctrl+P`
+switch profile, `Ctrl+Shift+N` new profile, `F1` this guide.
+
+### Profiles
+
+A **profile** is one saved setup -- PLC, tags, socket settings, log options --
+for one site, line or machine: *Acme Toledo / Press PLC*, *Acme Toledo /
+Conveyor*, *Dayton / Robot cell 4*. The open one's name is in the title bar
+beside the menus; click it to switch. The list is grouped by site, with the
+profile the service runs marked *service*.
+
+- **New profile...** starts from the defaults (the site is filled in from the
+  open one). **Duplicate this profile...** copies everything -- PLC, tags,
+  socket -- under a new name, the quick way to set up a second cell like the
+  first. **Rename or edit details...** changes the name, site, line or cell,
+  and the **notes**: anything worth knowing next time (the mirrored switch
+  port, the camera's address, who to call). The notes show when you hover
+  the name.
+- **Each profile logs into its own folder** under `logs\`, named after it,
+  so Live log, Trend and Latency only ever see that profile's events. Older
+  logs are still there to open with **Open file...**.
+- Switching stops the PLC and socket monitor first (it asks), and asks
+  whether to save changes to the profile you are leaving.
+- **Export this profile...** writes a `.plcmon` file to email or copy to
+  another PC; **Import profile...** reads one (or any old
+  `plc_monitor_config.json`). An export leaves out what belongs to this PC
+  -- the network adapter, this PC's own address, the log folder -- and turns
+  *Unattended* off; set those on the other PC.
+- **File > Profiles > Switch profile...** (`Ctrl+P`) lists every profile with
+  a search box, for when there are more than fit a menu.
+- From a shortcut or a script: `PLCMonitor.exe --profile "Acme Toledo/Press
+  PLC"` opens that profile; `PLCMonitor.exe headless --profile ...` runs it
+  without a window.
+
+Profiles are files in `C:\ProgramData\PLC Monitor\profiles\`. The first
+time 1.4 starts, the configuration from earlier versions becomes the profile
+*Default*, with its log where it was, and an installed service carries on
+running it.
 
 **View > Appearance** sets the theme, accent and density -- the same choices
 as the author's other applications. **View > Use the Windows title bar**
@@ -164,6 +200,15 @@ Choose the **PLC family** first; the fields follow it.
 Add tags in the box above the table, then **Connect**. Each value updates on
 every poll and flashes when it changes; *Changes* counts them. Every change is
 written to the log with its old and new value. Double-click a tag to rename it.
+Each family keeps its own tag list, so switching back and forth loses nothing.
+
+**Import...** fills the list from a file instead of typing: a Studio 5000
+**L5X** export or **tag CSV** (*Tools > Export > Tags and Logic Comments*),
+with program tags as `Program:<name>.<tag>`, or any CSV or text list with the
+tag names in a column headed *Tag*, *Name*, *Address* or *Device* (or one per
+line). A list opens with nothing ticked: search it, tick the tags you want,
+**Add**. UDTs and arrays are hidden unless you ask for them -- the log needs
+one value per tag.
 
 If the PLC stops answering altogether -- power-cycled, cable pulled, switch
 rebooted -- after a few seconds the *PLC* chip turns amber (*reconnecting*)
@@ -171,7 +216,6 @@ and PLC Monitor opens a new connection by itself, retrying every few seconds
 until a tag answers again; the log records when it was lost and when it came
 back. A tag that changed during the outage is logged with a window covering
 the whole outage. Tags that are simply wrong (a typo) do not trigger this.
-Each family keeps its own tag list, so switching back and forth loses nothing.
 
 **Adapter** matters when the PC is on more than one network: pick the one on
 the PLC's subnet. **Unattended** decides whether the service polls these tags.
@@ -277,11 +321,17 @@ writes to the same log, and restarts itself a minute after a crash.
 2. Turn on **Unattended** for the monitors the service should run.
 3. **Install** (Windows asks for administrator rights), then **Start**.
 
-*What it will run* says exactly what the service will do with the saved config.
+The service runs one **profile**, chosen under *What it will run* -- the one
+open in the window when it was installed, until you pick another. It can
+differ from the profile open in the window, and the page says when it does.
+A new choice takes effect when the service is next started. The service's
+profile cannot be deleted while it is chosen.
+
+*What it will run* says exactly what the service will do with that profile.
 If the PLC does not answer at boot the service keeps retrying every 15 seconds,
 and if it goes away later it reconnects by itself, the same as the window.
 Its own messages go to `service.log` beside the event log. **Run headless here**
-runs the same thing in a console window instead.
+runs the profile open in the window, in a console window instead.
 
 While the service is running, connecting from the window as well logs every
 change twice; stop the service first, or just watch the Live log.
@@ -357,7 +407,8 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 python -m app                  # the window
-python -m app headless         # monitors only, in this console
+python -m app headless         # the service's profile, in this console
+python -m app --profile "Site/Name"   # open a given profile
 pytest                         # tests
 python tools/preview.py        # render every page to PNG, offscreen
 build.bat                      # dist\PLCMonitor\ and, with Inno Setup, the installer
@@ -369,6 +420,28 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.4.0 -- 2026-11-09
+
+Profiles: one saved setup per site, line or PLC.
+
+- The open profile is named in the title bar; click it to switch. Profiles
+  are grouped by site, carry a line or cell and free-text notes, and each logs
+  into its own folder.
+- New, Duplicate, Rename / edit details, Delete, and Manage profiles (a
+  searchable list, `Ctrl+P`). Switching stops running monitors and asks about
+  unsaved changes first.
+- Export a profile to a `.plcmon` file and import it on another PC; the
+  network adapter and this PC's address stay behind.
+- The Service page chooses which profile the service runs. Saving the
+  service's profile while it runs says to restart it.
+- `--profile "Site/Name"` for the window and for `headless`.
+- Tags: **Import...** reads a Studio 5000 L5X or tag CSV export, or any CSV
+  or text list, into a searchable list to tick from.
+- The configuration from earlier versions becomes the profile *Default*;
+  an installed service carries on running it.
+- Fixed: a setting changed in one config could change the defaults for any
+  config created later in the same session.
 
 ### 1.3.0 -- 2026-11-09
 

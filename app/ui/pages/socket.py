@@ -312,3 +312,6 @@ class SocketPage(Page):
 
     def shown(self) -> None:
         self._readiness(self.mode.value())
+
+    def profile_changed(self) -> None:
+        self.load_from_config()

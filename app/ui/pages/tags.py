@@ -375,7 +375,11 @@ class TagsPage(Page):
         add = w.button("Add", icon_name="plus", slot=self._add)
         remove = w.button("Remove", icon_name="minus", slot=self._remove,
                           tip="Remove the selected tags")
-        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, remove, stretch_at=0))
+        import_btn = w.button("Import...", slot=self._import,
+                              tip="Add tags from a Studio 5000 L5X or tag CSV export, or any "
+                                  "CSV or text list of tag names")
+        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, remove, import_btn,
+                                        stretch_at=0))
         self.example = w.label("", "hint", wrap=True)
         table_card.body.addWidget(self.example)
 
@@ -589,6 +593,34 @@ class TagsPage(Page):
             return
         self.new_tag.clear()
 
+    def _import(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        from app.engine.tagimport import TagImportError, read
+        from app.ui.tagpicker import TagPickerDialog
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import tags", "",
+            "Tag lists (*.L5X *.l5x *.csv *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            entries = read(path)
+        except TagImportError as exc:
+            w.error(self, "Import tags", "No tags were imported.", str(exc))
+            return
+        existing = {e["tag"] for e in self.model.entries()}
+        dialog = TagPickerDialog(entries, existing, os.path.basename(path), self)
+        if not dialog.exec():
+            return
+        added = 0
+        for entry in dialog.chosen():
+            dtype = entry.dtype.upper() if entry.dtype.upper() in DATA_TYPES else self.new_type.currentText()
+            if self.model.add(entry.tag, dtype):
+                added += 1
+        self.session.status.emit(f"Added {added} tag{'s' if added != 1 else ''} from "
+                                 f"{os.path.basename(path)}")
+
     def _remove(self) -> None:
         rows = [i.row() for i in self.table.selectionModel().selectedRows()]
         if rows:
@@ -664,3 +696,7 @@ class TagsPage(Page):
     def theme_changed(self) -> None:
         super().theme_changed()
         self.table.viewport().update()
+
+    def profile_changed(self) -> None:
+        self.model.clear_values()
+        self.load_from_config()

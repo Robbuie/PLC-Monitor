@@ -37,18 +37,22 @@ plain path for when they are absent.
 
 ```
 app/
-  __main__.py        gui | headless | service (SCM entry); --config
+  __main__.py        gui | headless | service (SCM entry); --profile, --config
   paths.py           ProgramData (config, logs, lib) vs LOCALAPPDATA (ui.json); legacy migration
   service.py         PLCMonitorService (pywin32) + sc.exe control, elevated through one UAC prompt
   engine/            no Qt. Drivers, poller, socket monitors, sniffer, logger, config
     monitors.py      THE way a config becomes a driver / socket monitor -- window and service both
+    profiles.py      profiles (ProgramData\profiles\*.json), the service pointer, first-run migration
+    clock.py         the precise wall clock every row is stamped with
+    tagimport.py     L5X / tag CSV / plain list -> tag entries
     headless.py      the unattended runner (retries the PLC every 15 s)
     logdata.py       reading logs back: trend series, latency pairing
     robdata.py       reading RobControl's trend recording (SQLite, read-only) for the Trend page
     network_discovery.py   connections, gentle port check, read-only PLC handshakes
   core/              no widgets. settings.py (ui.json), updates.py, themeswitch.py, siblings.py
   theme/             tokens.py (copied from File Manager), qss.py (copied), sheet.py (ours)
-  ui/                window, titlebar, rail, widgets, appearance, guide, session, pages/
+  ui/                window, titlebar, rail, widgets, appearance, guide, session, pages/,
+                     profiles_ui (switcher, details, Manage), tagpicker
 packaging/           build.py, plcmonitor.spec, installer.iss, icon.py
 tools/preview.py     offscreen screenshots with a made-up log
 tests/
@@ -64,6 +68,13 @@ headless_runner.py   kept for old shortcuts
   exactly what the service will run.
 - `plc.enabled` / `socket.enabled` mean "run under the service". The window
   ignores them.
+- A profile is an ordinary config file plus a `profile` block (name, site,
+  line, notes) that only app/engine/profiles.py writes; ConfigManager.save
+  keeps the block that is on disk. The file name is the id and never changes.
+  The service runs the profile named in `ProgramData\service.json`; the window
+  opens the one last used (ui.json `profile`).
+- The logger writes on its own thread. Anything that reads the file right
+  after logging (tests, mostly) calls `logger.flush()` first.
 
 ### The design system
 
@@ -95,7 +106,8 @@ vision; a tag keeps its colour for the session; eight lines maximum.
 ```
 pip install -r requirements.txt
 python -m app
-python -m app headless --config path\to\config.json
+python -m app headless --profile "Site/Name"     (or --config path\to\config.json)
+PLCMON_LIBPLCTAG_DIR=<libplctag release folder> pytest tests/test_libplctag_live.py   # against ab_server
 QT_QPA_PLATFORM=offscreen pytest
 python tools/preview.py --themes dark,light,control --out-dir previews
 python packaging/build.py          # needs Inno Setup 6 for the installer

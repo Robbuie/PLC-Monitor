@@ -1,6 +1,6 @@
 [project]
 name = "plc-monitor"
-version = "1.3.0"
+version = "1.4.0"
 description = "Timestamps PLC tag changes and socket messages to the millisecond"
 requires-python = ">=3.11"
 

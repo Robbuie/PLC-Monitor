@@ -10,6 +10,7 @@ the window looks is not in here; that is one person's preference and lives in
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -80,13 +81,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    result = dict(base)
+    """`override` laid over `base`, as a new dict sharing nothing with either.
+
+    Before 1.4 the result shared nested dicts with `base` -- which is
+    DEFAULT_CONFIG -- so setting a value in one config's section that the
+    file lacked changed the defaults for every config made afterwards in the
+    same process. With one config per run nobody noticed; with profiles, a
+    new profile would have inherited the open one's settings.
+    """
+    result = copy.deepcopy(base)
     for k, v in override.items():
         if k in result and isinstance(result[k], dict) and isinstance(v, dict):
             result[k] = _deep_merge(result[k], v)
         else:
-            result[k] = v
+            result[k] = copy.deepcopy(v)
     return result
+
+
+def _read_json(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 class ConfigManager:
@@ -122,6 +139,12 @@ class ConfigManager:
         """Write atomically: a crash halfway through must not leave the
         service a config it cannot parse at the next boot."""
         self._data["service"]["config_path"] = os.path.abspath(self.path)
+        # The profile block (name, site, notes) belongs to app/engine/profiles,
+        # which may have changed it on disk since this copy was loaded -- a
+        # rename while the profile is open. Keep the one on disk.
+        on_disk = _read_json(self.path)
+        if isinstance(on_disk, dict) and isinstance(on_disk.get("profile"), dict):
+            self._data["profile"] = on_disk["profile"]
         folder = os.path.dirname(os.path.abspath(self.path))
         if folder == paths.data_dir():
             paths.ensure_data_dir()

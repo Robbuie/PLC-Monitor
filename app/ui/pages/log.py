@@ -405,3 +405,8 @@ class LogPage(Page):
     def theme_changed(self) -> None:
         super().theme_changed()
         self.table.viewport().update()
+
+    def profile_changed(self) -> None:
+        # The rows on screen are the old profile's; its log has them all.
+        self._clear()
+        self._load_settings()

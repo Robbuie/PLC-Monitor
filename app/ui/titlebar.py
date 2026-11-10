@@ -42,6 +42,8 @@ class TitleBar(QWidget):
         self.name.setProperty("role", "apptitle")
         self.menus = QMenuBar()
         self.menus.setNativeMenuBar(False)
+        from app.ui.profiles_ui import ProfileButton
+        self.profile = ProfileButton()
 
         self.plc_chip = w.chip("PLC  off", "idle")
         self.sock_chip = w.chip("Socket  off", "idle")
@@ -59,6 +61,7 @@ class TitleBar(QWidget):
         row.addWidget(self.mark)
         row.addWidget(self.name)
         row.addWidget(self.menus)
+        row.addWidget(self.profile)
         row.addStretch(1)
         row.addWidget(self.svc_chip)
         row.addSpacing(6)

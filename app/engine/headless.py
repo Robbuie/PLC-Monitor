@@ -44,9 +44,8 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
     from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, tags_for
     from app.engine.plc_poller import PLCPoller
 
-    config_path = config_path or paths.config_path()
-    if not os.path.exists(config_path):
-        paths.migrate_legacy_config()
+    from app.engine import profiles
+    config_path = config_path or profiles.service_config_path()
     if not os.path.exists(config_path):
         log.error("Config file not found: %s", config_path)
         return 2
@@ -61,8 +60,10 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
         rotate_daily=bool(lg.get("rotate_daily", True)),
     )
     from app.engine import clock
-    logger.log(EV_INFO, "Runner", notes=f"Headless runner started (config {config_path}; "
-                                        f"clock {clock.SOURCE})")
+    profile = profiles.info(config_path) if profiles.is_profile_path(config_path) else None
+    what = f"profile {profile.label}" if profile else f"config {config_path}"
+    logger.log(EV_INFO, "Runner", notes=f"Headless runner started ({what}; clock {clock.SOURCE})")
+    log.info("Running %s", what)
     log.info("Logging to %s", lg["log_path"])
 
     def status(msg: str) -> None:

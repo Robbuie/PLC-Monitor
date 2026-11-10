@@ -20,6 +20,7 @@ from datetime import datetime
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from app import paths
+from app.engine import profiles
 from app.engine.config_manager import ConfigManager
 from app.engine.event_log import EventLogger
 from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, describe_socket, tags_for
@@ -33,6 +34,8 @@ class Session(QObject):
     tagValue = Signal(str, object, str)  # tag, value, HH:MM:SS.mmm
     events = Signal(list)              # rows logged since the last pump
     logPathChanged = Signal(str)
+    profileChanged = Signal()          # another profile (or config file) is now open
+    profileDetails = Signal()          # a profile renamed, or the service pointed elsewhere
     fill = Signal(str, str)            # field key, value -- "Use as ..." from another page
     goto = Signal(str)                 # bring a page to the front
     configSaved = Signal()
@@ -41,9 +44,12 @@ class Session(QObject):
     _connected = Signal(object, bool, str, list, int)
     _pollerState = Signal(object, str, str)
 
-    def __init__(self, config_path: str | None = None, parent: QObject | None = None) -> None:
+    def __init__(self, config_path: str | None = None, parent: QObject | None = None,
+                 last_profile: str | None = None) -> None:
         super().__init__(parent)
         migrated = paths.migrate_legacy_config() if not config_path else None
+        if not config_path:
+            config_path = profiles.startup_path(last_profile)
         self.cfg = ConfigManager(config_path)
         self.migrated_from = migrated
         self._queue: queue.Queue[dict] = queue.Queue(maxsize=20000)
@@ -86,6 +92,47 @@ class Session(QObject):
         self.cfg.set("logging", "log_path", path)
         self.save_config()
         self.logPathChanged.emit(path)
+
+    # ------------------------------------------------------------ profiles
+
+    @property
+    def profile(self) -> "profiles.Profile | None":
+        """The open profile, or None when a plain config file was opened
+        with --config."""
+        if profiles.is_profile_path(self.cfg.path):
+            return profiles.info(self.cfg.path)
+        return None
+
+    def profile_label(self) -> str:
+        profile = self.profile
+        return profile.label if profile else os.path.basename(self.cfg.path)
+
+    def open_config(self, path: str) -> None:
+        """Make another profile (or config file) the open one.
+
+        The monitors must be stopped first: what is running was built from
+        the old one, and its rows would land in the new one's log.
+        """
+        if self.plc_running or self.sock_running:
+            raise RuntimeError("Stop the PLC and socket monitor before switching profile.")
+        self.logger.flush()
+        self.cfg = ConfigManager(path)
+        lg = self.cfg.logging
+        self.logger.max_bytes = int(lg.get("max_mb", 50)) * 1024 * 1024
+        self.logger.max_rotated = int(lg.get("max_rotated", 30))
+        self.logger.rotate_daily = bool(lg.get("rotate_daily", True))
+        if os.path.abspath(lg["log_path"]) != os.path.abspath(self.logger.log_path):
+            self.logger.set_log_path(lg["log_path"])
+        # Rows of the old profile still waiting for the Live log belong to it.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self.event_count = 0
+        self.plc_detail = self.sock_detail = ""
+        self.profileChanged.emit()
+        self.logPathChanged.emit(lg["log_path"])
 
     # -------------------------------------------------------------- config
 

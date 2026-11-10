@@ -91,6 +91,21 @@ QToolButton[role="caption"]:pressed {{ background: {bg_4}; }}
 QToolButton[role="caption"][kind="close"]:hover {{ background: {close_hover}; }}
 QToolButton[role="caption"][kind="close"]:pressed {{ background: {close_press}; }}
 
+/* The open profile, beside the menus. Reads as a label until hovered; the
+   caret is a glyph, so the style's own menu arrow is hidden. */
+QToolButton[role="profile"] {{
+    background: transparent;
+    border: 1px solid {line_soft};
+    border-radius: {radius};
+    color: {txt_0};
+    font-weight: 600;
+    padding: 2px 8px;
+    margin-left: 10px;
+}}
+QToolButton[role="profile"]:hover {{ background: {bg_3}; }}
+QToolButton[role="profile"]:pressed {{ background: {bg_4}; }}
+QToolButton[role="profile"]::menu-indicator {{ image: none; width: 0px; }}
+
 /* The chips in the title bar: what is running, readable from across the room.
    Semantic colours only. */
 QLabel[role="chip"] {{
@@ -351,6 +366,10 @@ QListView::item, QListWidget::item {{ padding: 3px 6px; border-radius: {radius_s
 QListView::item:hover, QListWidget::item:hover {{ background: {bg_3}; }}
 QListView::item:selected, QListWidget::item:selected {{ background: {accent_row}; color: {txt_0}; }}
 QTableView::item:hover {{ background: transparent; }}
+/* Trees (the Profiles list): a selected row is highlighted across, branch
+   included, and rows get the list's breathing room. */
+QTreeView::item {{ padding: 3px 6px; }}
+QTreeView::item:selected, QTreeView::branch:selected {{ background: {accent_row}; color: {txt_0}; }}
 QHeaderView {{ background: transparent; }}
 QHeaderView::section {{
     background: transparent;

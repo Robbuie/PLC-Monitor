@@ -53,3 +53,7 @@ class Page(QWidget):
 
     def save_into_config(self) -> None:
         """Copy what is on screen into the session's config (not to disk)."""
+
+    def profile_changed(self) -> None:
+        """Another profile is open: show its settings. The log-reading pages
+        follow `logPathChanged` instead."""

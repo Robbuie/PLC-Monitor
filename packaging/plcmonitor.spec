@@ -59,6 +59,10 @@ hidden = scapy_hidden + [
     "pywintypes", "win32timezone",
     # Drivers, imported inside functions so a missing one only disables itself.
     "pycomm3", "snap7", "snap7.client", "snap7.util", "pymcprotocol",
+    # Found by name at run time (python-snap7 moved its area enum between
+    # versions), so the import graph cannot see it.
+    "snap7.type",
+    "app.engine.profiles", "app.engine.tagimport", "app.engine.clock", "app.ui.tagpicker",
     "psutil", "matplotlib.backends.backend_qtagg",
 ]
 

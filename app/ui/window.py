@@ -19,6 +19,7 @@ from PySide6.QtCore import QByteArray, QEvent, QPoint, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
 )
 
 from app import __version__, paths
+from app.engine import profiles
+from app.engine.profiles import ProfileError
 from app.core import siblings, themeswitch, updates
 from app.core.settings import Settings
 from app.theme import sheet
@@ -44,6 +47,7 @@ from app.ui.pages.service import ServicePage
 from app.ui.pages.socket import SocketPage
 from app.ui.pages.tags import TagsPage
 from app.ui.pages.trend import TrendPage
+from app.ui.profiles_ui import ManageProfilesDialog, ProfileDetailsDialog
 from app.ui.rail import Rail
 from app.ui.session import Session
 from app.ui.titlebar import TitleBar
@@ -113,6 +117,13 @@ class MainWindow(QMainWindow):
         session.sockState.connect(self._sock_chip)
         session.serviceState.connect(self._svc_chip)
         session.goto.connect(self.show_page)
+        session.profileChanged.connect(self._show_profile)
+        session.profileDetails.connect(self._show_profile)
+        session.configSaved.connect(self._mark_clean)
+        self.titlebar.profile.recent = list(settings.get("profiles.recent") or [])
+        self.titlebar.profile.chosen.connect(self.switch_profile)
+        self.titlebar.profile.action.connect(lambda key: self.profile_action(key))
+        self._show_profile()
 
         self._stats = QTimer(self)
         self._stats.setInterval(2000)
@@ -139,6 +150,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(400, lambda: self._say(
                 f"Settings carried over from {session.migrated_from} to {session.cfg.path}"))
         self.updates.start_if_wanted()
+        self._mark_clean()
 
     # ------------------------------------------------------------- pages
 
@@ -168,6 +180,15 @@ class MainWindow(QMainWindow):
 
         file_menu = bar.addMenu("&File")
         act(file_menu, "Save config", self.save_config, "Ctrl+S")
+        prof = file_menu.addMenu("Profiles")
+        act(prof, "Switch profile...", lambda: self.profile_action("manage"), "Ctrl+P")
+        act(prof, "New profile...", lambda: self.profile_action("new"), "Ctrl+Shift+N")
+        self.a_dup = act(prof, "Duplicate this profile...", lambda: self.profile_action("duplicate"))
+        self.a_edit = act(prof, "Rename or edit details...", lambda: self.profile_action("edit"))
+        prof.addSeparator()
+        act(prof, "Import profile...", lambda: self.profile_action("import"))
+        self.a_export = act(prof, "Export this profile...", lambda: self.profile_action("export"))
+        file_menu.addSeparator()
         act(file_menu, "Open log folder", lambda: open_folder(self.session.log_folder()))
         act(file_menu, "Open data folder", lambda: open_folder(paths.ensure_data_dir()))
         file_menu.addSeparator()
@@ -295,7 +316,201 @@ class MainWindow(QMainWindow):
         for page in self.pages.values():
             page.save_into_config()
         if self.session.save_config():
-            self._say(f"Config saved to {self.session.cfg.path}")
+            self._say(f"Saved {self.session.profile_label()}")
+            profile = self.session.profile
+            if (profile is not None and profile.id == profiles.service_profile_id()
+                    and self.session.service == "RUNNING"):
+                self._say(f"Saved {profile.label}. The service runs this profile: restart it "
+                          "on the Service page to pick up the change.")
+
+    # ---------------------------------------------------------- profiles
+
+    def _show_profile(self) -> None:
+        """The open profile's name in the title bar and the window title."""
+        profile = self.session.profile
+        label = self.session.profile_label()
+        tip = [f"Profile: {label}" if profile else f"Config file: {self.session.cfg.path}"]
+        if profile is not None:
+            if profile.line:
+                tip.append(f"Line / cell: {profile.line}")
+            if profile.id == profiles.service_profile_id():
+                tip.append("The service runs this profile.")
+            if profile.notes:
+                tip.append("")
+                tip.append(profile.notes)
+        tip.append("")
+        tip.append("Click to switch profile.")
+        self.titlebar.profile.show_profile(label, "\n".join(tip),
+                                           profile.id if profile else None)
+        self.setWindowTitle(f"{label} - PLC Monitor")
+        has = profile is not None
+        for action in (self.a_dup, self.a_edit, self.a_export):
+            action.setEnabled(has)
+
+    def _snapshot(self) -> dict:
+        """What the pages hold now, as config. Compared with the copy taken
+        when the profile was opened or last saved, it says whether there is
+        anything unsaved. (Comparing with the file instead reports changes
+        nobody made: a page fills in an adapter or an empty tag list where
+        the file has none.)"""
+        import copy
+        for page in self.pages.values():
+            page.save_into_config()
+        data = copy.deepcopy(self.session.cfg.as_dict())
+        data.pop("profile", None)
+        data.get("service", {}).pop("config_path", None)
+        return data
+
+    def _mark_clean(self) -> None:
+        self._clean = self._snapshot()
+
+    def has_unsaved_changes(self) -> bool:
+        return self._snapshot() != getattr(self, "_clean", None)
+
+    def _remember(self, profile_id: str) -> None:
+        recent = [profile_id] + [r for r in (self.settings.get("profiles.recent") or [])
+                                 if r != profile_id]
+        recent = recent[:10]
+        self.settings.set("profile", profile_id)
+        self.settings.set("profiles.recent", recent)
+        self.settings.save()
+        self.titlebar.profile.recent = recent
+
+    def _ready_to_leave(self, doing: str) -> bool:
+        """Before another profile opens: nothing running, nothing unsaved
+        lost without asking. False means stay."""
+        if self.session.plc_running or self.session.sock_running:
+            if not w.ask(self, "Profiles", "Monitoring is running.",
+                         f"Stop the PLC and socket monitor and {doing}? What they logged "
+                         "stays in this profile's log.", yes="Stop and continue"):
+                return False
+            self.session.disconnect_plc()
+            self.session.stop_socket()
+        if not self.has_unsaved_changes():
+            return True
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Profiles")
+        box.setText(f"Save the changes to {self.session.profile_label()}?")
+        box.setInformativeText("They are lost if you do not save them.")
+        save = box.addButton("Save", QMessageBox.AcceptRole)
+        discard = box.addButton("Don't save", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(save)
+        box.exec()
+        if box.clickedButton() is save:
+            return self.session.save_config()
+        return box.clickedButton() is discard
+
+    def switch_profile(self, profile_id: str) -> bool:
+        profile = profiles.get(profile_id)
+        if profile is None:
+            w.error(self, "Profiles", "That profile no longer exists.")
+            return False
+        current = self.session.profile
+        if current is not None and current.id == profile.id:
+            return True
+        if not self._ready_to_leave(f"open {profile.label}"):
+            return False
+        self.session.open_config(profile.path)
+        for page in self.pages.values():
+            page.profile_changed()
+        self._mark_clean()
+        self._remember(profile.id)
+        self._say(f"Opened {profile.label}")
+        return True
+
+    def profile_action(self, key: str, profile_id: str | None = None,
+                       parent: QWidget | None = None) -> None:
+        parent = parent or self
+        current = self.session.profile
+        target = profiles.get(profile_id) if profile_id else current
+        sites = [p.site for p in profiles.list_profiles()]
+        if key == "manage":
+            self._manage()
+        elif key == "new":
+            made = {}
+            dialog = ProfileDetailsDialog(
+                "New profile", parent, sites=sites, ok_text="Create",
+                check=lambda v: made.setdefault("p", profiles.create(**v)))
+            if current is not None and current.site:
+                dialog.site.setText(current.site)
+            if dialog.exec() and made.get("p"):
+                self.switch_profile(made["p"].id)
+        elif key == "duplicate" and target is not None:
+            # Copy what is on screen, not what was last saved -- without
+            # saving the original behind the person's back.
+            snapshot = self._snapshot() if target.id == getattr(current, "id", None) else None
+            made = {}
+            draft = profiles.Profile(id="", path="", name=f"{target.name} (copy)",
+                                     site=target.site, line=target.line, notes=target.notes)
+            dialog = ProfileDetailsDialog(
+                f"Duplicate {target.label}", parent, profile=draft, sites=sites, ok_text="Duplicate",
+                check=lambda v: made.setdefault("p", profiles.duplicate(target.id, data=snapshot,
+                                                                        **v)))
+            if dialog.exec() and made.get("p"):
+                if w.ask(parent, "Duplicate", f"Made {made['p'].label}.", "Open it now?",
+                         yes="Open"):
+                    self.switch_profile(made["p"].id)
+        elif key == "edit" and target is not None:
+            dialog = ProfileDetailsDialog(
+                f"Edit {target.label}", parent, profile=target, sites=sites,
+                check=lambda v: profiles.update_details(target.id, **v))
+            if dialog.exec():
+                self.session.profileDetails.emit()
+        elif key == "delete" and target is not None:
+            if w.ask(parent, "Delete profile", f"Delete {target.label}?",
+                     "Its settings and tags are removed. Its logs are kept, in their "
+                     "folder under the log folder.", yes="Delete"):
+                try:
+                    profiles.delete(target.id)
+                except (ProfileError, OSError) as exc:
+                    w.error(parent, "Delete profile", "The profile was not deleted.", str(exc))
+        elif key == "import":
+            path, _ = QFileDialog.getOpenFileName(
+                parent, "Import profile", "", "PLC Monitor profiles (*.plcmon *.json);;All files (*)")
+            if not path:
+                return
+            try:
+                made = profiles.import_file(path)
+            except (ProfileError, OSError) as exc:
+                w.error(parent, "Import profile", "The profile was not imported.", str(exc))
+                return
+            if w.ask(parent, "Import profile", f"Imported {made.label}.",
+                     "The network adapter and this PC's own address are not carried over; "
+                     "set them on the Tags and Socket pages. Open it now?", yes="Open"):
+                self.switch_profile(made.id)
+        elif key == "export" and target is not None:
+            snapshot = self._snapshot() if target.id == getattr(current, "id", None) else None
+            suggested = profiles._safe(target.label.replace(" / ", " - ")) + profiles.EXPORT_EXT
+            path, _ = QFileDialog.getSaveFileName(parent, "Export profile", suggested,
+                                                  "PLC Monitor profiles (*.plcmon)")
+            if not path:
+                return
+            try:
+                written = profiles.export(target.id, path, data=snapshot)
+            except (ProfileError, OSError) as exc:
+                w.error(parent, "Export profile", "The profile was not exported.", str(exc))
+                return
+            self._say(f"Exported {target.label} to {written}")
+
+    def _manage(self) -> None:
+        current = self.session.profile
+        dialog = ManageProfilesDialog(current.id if current else None, self)
+
+        def opened(pid: str) -> None:
+            if self.switch_profile(pid):
+                dialog.accept()
+
+        def acted(key: str, pid: str) -> None:
+            self.profile_action(key, pid or None, parent=dialog)
+            now = self.session.profile
+            dialog.current_id = now.id if now else None
+            dialog.refresh()
+
+        dialog.opened.connect(opened)
+        dialog.action.connect(acted)
+        dialog.exec()
 
     # ------------------------------------------------------------ frame
 
@@ -393,6 +608,9 @@ class MainWindow(QMainWindow):
         for page in self.pages.values():
             page.save_into_config()
         self.session.save_config()
+        profile = self.session.profile
+        if profile is not None:
+            self._remember(profile.id)
         self.settings.set("window.maximized", self.isMaximized())
         if not self.isMaximized():
             self.settings.set("window.geometry", bytes(self.saveGeometry().toBase64()).decode("ascii"))

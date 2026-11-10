@@ -3,6 +3,28 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.4.0] - 2026-11-09
+
+Profiles: one saved setup per site, line or PLC.
+
+- The open profile is named in the title bar; click it to switch. Profiles
+  are grouped by site, carry a line or cell and free-text notes, and each logs
+  into its own folder.
+- New, Duplicate, Rename / edit details, Delete, and Manage profiles (a
+  searchable list, Ctrl+P). Switching stops running monitors and asks about
+  unsaved changes first.
+- Export a profile to a .plcmon file and import it on another PC; the
+  network adapter and this PC's address stay behind.
+- The Service page chooses which profile the service runs. Saving the
+  service's profile while it runs says to restart it.
+- --profile "Site/Name" for the window and for headless.
+- Tags: Import... reads a Studio 5000 L5X or tag CSV export, or any CSV or
+  text list, into a searchable list to tick from.
+- The configuration from earlier versions becomes the profile "Default";
+  an installed service carries on running it.
+- Fixed: a setting changed in one config could change the defaults for any
+  config created later in the same session.
+
 ## [1.3.0] - 2026-11-09
 
 Runs unattended for weeks.

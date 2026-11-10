@@ -58,3 +58,17 @@ def test_libplctag_driver_gets_per_tag_types():
     assert driver.tag_types == {"Speed": "REAL"}
     assert "elem_size=4" in driver.cfg.build_attrib("Speed", "REAL")
     assert "elem_size=1" in driver.cfg.build_attrib("Bit", "BOOL")
+
+
+def test_a_config_never_changes_the_defaults(tmp_path):
+    """A section the file lacks used to be the defaults' own dict."""
+    from app.engine.config_manager import DEFAULT_CONFIG
+    before = json.dumps(DEFAULT_CONFIG, sort_keys=True)
+    cfg = ConfigManager(str(tmp_path / "none.json"))
+    cfg.set("socket", "sniff", {"host": "10.9.9.9"})
+    cfg.socket["listen_port"] = 1
+    cfg.plc["libplctag"]["cpu"] = "micro800"
+    (tmp_path / "partial.json").write_text('{"plc": {"ip": "1.1.1.1"}}', encoding="utf-8")
+    other = ConfigManager(str(tmp_path / "partial.json"))
+    other.service["name"] = "changed"
+    assert json.dumps(DEFAULT_CONFIG, sort_keys=True) == before
