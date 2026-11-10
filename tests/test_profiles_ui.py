@@ -303,3 +303,125 @@ def test_duplicate_and_export_take_what_is_on_screen_without_saving_it(window, a
     assert data["plc"]["ip"] == "10.0.40.42" and data["profile"]["name"] == "Press"
     assert ConfigManager(profiles.get(a).path).plc["ip"] == "10.0.40.11"
     assert window.has_unsaved_changes()
+
+
+def test_the_add_box_takes_a_group_and_edit_combines_registers(window, app, monkeypatch):
+    from PySide6.QtCore import QItemSelectionModel
+    from app.ui import tagedit
+    tags = window.pages["tags"]
+    tags.new_tag.setText("D1000 x4 ascii")
+    tags._add()
+    added = tags.model.rows[-1]["spec"]
+    assert (added.address, added.count, added.fmt) == ("D1000", 4, "ascii")
+    assert tags.model.data(tags.model.index(len(tags.model.rows) - 1, 1)) == \
+        "D1000-D1003 as Text (ASCII, 2 per register)"
+
+    for t in ("D1916", "D1917", "D1918", "D1919"):
+        tags.new_tag.setText(t)
+        tags._add()
+    first = len(tags.model.rows) - 4
+    sel = tags.table.selectionModel()
+    sel.clearSelection()
+    for i in range(first, first + 4):
+        sel.select(tags.model.index(i, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+    def run(dialog):
+        assert (dialog.count.value(), dialog.fmt.currentData()) == (4, "ascii")
+        dialog.name.setText("Plant VIN")
+        return 1
+
+    monkeypatch.setattr(tagedit.TagEditDialog, "exec", run)
+    tags._edit()
+    keys = [r["spec"].key for r in tags.model.rows]
+    assert "Plant VIN" in keys and "D1917" not in keys
+    window.save_config()
+    saved = window.session.cfg.plc["tags_per_driver"]["Rockwell (pycomm3)"]
+    assert {"tag": "D1916", "dtype": "DINT", "count": 4, "format": "ascii",
+            "name": "Plant VIN"} in saved
+
+
+def test_combining_refuses_registers_that_are_not_consecutive(window, app, monkeypatch):
+    from PySide6.QtCore import QItemSelectionModel
+    tags = window.pages["tags"]
+    for t in ("D10", "D12"):
+        tags.new_tag.setText(t)
+        tags._add()
+    sel = tags.table.selectionModel()
+    sel.clearSelection()
+    for i in (len(tags.model.rows) - 2, len(tags.model.rows) - 1):
+        sel.select(tags.model.index(i, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows)
+    told = []
+    monkeypatch.setattr("app.ui.widgets.info", lambda *a, **k: told.append(a[2]))
+    tags._edit()
+    assert told and "consecutive" in told[0]
+
+
+def test_renaming_a_group_in_the_table_sets_its_name(window, app):
+    tags = window.pages["tags"]
+    tags.new_tag.setText("D200 x2 int32")
+    tags._add()
+    row = len(tags.model.rows) - 1
+    assert tags.model.setData(tags.model.index(row, 0), "Part count")
+    spec = tags.model.rows[row]["spec"]
+    assert (spec.name, spec.address) == ("Part count", "D200")
+    assert tags.model.setData(tags.model.index(row, 0), "D200 x2")      # back to plain
+    assert spec.name == ""
+
+
+def test_tag_edit_dialog(app):
+    from app.engine.tagspec import TagSpec
+    from app.ui.tagedit import TagEditDialog
+    dialog = TagEditDialog(TagSpec("D200"), "Edit", False)
+    dialog.fmt.setCurrentIndex(dialog.fmt.findData("int32"))
+    assert dialog.count.value() == 2                     # a 32-bit format needs two
+    dialog.count.setValue(3)
+    assert not dialog.ok.isEnabled() and "even number" in dialog.preview.text()
+    dialog.count.setValue(2)
+    dialog.swap_words.setChecked(True)
+    spec = dialog.spec()
+    assert (spec.count, spec.fmt, spec.swap_words) == (2, "int32", True)
+    assert dialog.ok.isEnabled()
+    assert not dialog.swap_bytes.isEnabled()
+
+
+def test_latency_page_matches_on_value_and_decodes_old_logs(window, app, tmp_path):
+    """An old-style log with a row per register: the Latency page decodes it
+    through the profile's grouped tags and pairs by VIN."""
+    import time as _time
+    lines = ["timestamp_ms,timestamp_human,event_type,source,tag_or_addr,old_value,new_value,raw_hex,notes"]
+    vin1 = [12609, 13106, 13620, 14134]          # A1234567
+    unknown = [21808, 19278, 20302, 20055]       # 0UNKNOWN
+    def put(ms, base, old, new):
+        for i, (a, b) in enumerate(zip(old, new)):
+            if a != b:
+                lines.append(f"{ms + i},x,PLC_CHANGED,M,D{base + i},{a},{b},,")
+    put(1_000_000, 1916, [0] * 4, unknown)
+    put(1_004_000, 1916, unknown, vin1)
+    put(1_006_000, 1000, [0] * 4, vin1)          # sent 2 s later
+    put(1_006_300, 1000, vin1, [0] * 4)
+    path = tmp_path / "old.csv"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    window.session.cfg.set("plc", "tags_per_driver", {"Mitsubishi (MC Proto)": [
+        {"tag": "D1916", "count": 4, "format": "ascii", "name": "Plant VIN"},
+        {"tag": "D1000", "count": 4, "format": "ascii", "name": "Sent VIN"}]})
+    page = window.pages["latency"]
+    page._extra.append(str(path))
+    page.refresh_sources()
+    page.source.setCurrentIndex(page.source.findData(str(path)))
+    page.trigger.kind.set_value("plc")
+    page.trigger._kind("plc")
+    page.trigger.tag.setEditText("Plant VIN")
+    page.trigger.value.setText("!0UNKNOWN")
+    page.response.kind.set_value("plc")
+    page.response._kind("plc")
+    page.response.tag.setEditText("Sent VIN")
+    page.give_up.setValue(60_000)
+    page.same_value.setChecked(True)
+    page.measure()
+    deadline = _time.time() + 10
+    while _time.time() < deadline and page._result is None:
+        app.processEvents()
+        _time.sleep(0.02)
+    assert page._result is not None
+    assert page._result.answered == [2000]       # stamped by the last register of each poll

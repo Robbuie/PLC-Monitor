@@ -14,7 +14,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: What the built app imports at run time, including what it imports late.
 RUNTIME = [
     "app.ui.window", "app.ui.pages.trend", "app.ui.pages.latency", "app.ui.tagpicker",
-    "app.engine.headless", "app.engine.profiles", "app.engine.tagimport",
+    "app.engine.headless", "app.engine.profiles", "app.engine.tagimport", "app.engine.tagspec",
+    "app.ui.tagedit", "sqlite3", "zipfile", "xml.etree.ElementTree",
     "matplotlib", "matplotlib.backends.backend_qtagg", "matplotlib.figure",
     "numpy", "psutil", "pycomm3", "snap7", "snap7.client", "snap7.util", "pymcprotocol",
     "scapy.all",

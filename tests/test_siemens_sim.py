@@ -123,3 +123,13 @@ def test_the_poller_reconnects_when_the_s7_server_comes_back(tmp_path, monkeypat
     changes = [(r["old_value"], r["new_value"]) for r in logdata.read_rows(str(tmp_path / "log.csv"))
                if r["event_type"] == "PLC_CHANGED"]
     assert changes == [("5", "9")]
+
+
+def test_a_word_block_reads_in_one_request(plc):
+    """DB10,WORD12 x2 -> the two words at offsets 12 and 14, high byte first."""
+    words, err = plc.read_block("DB10,WORD12", 2)
+    assert err is None
+    assert words == [0xFFFB, 200 << 8]          # INT -5 at 12; byte 200 at 14
+    from app.engine.tagspec import TagSpec
+    assert TagSpec("DB10,INT12", 1, "int16").decode(words[:1]) == -5
+    assert plc.read_block("M1.1", 2)[1].startswith("A grouped Siemens tag")

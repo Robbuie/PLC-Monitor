@@ -37,6 +37,7 @@ from app.core import siblings
 from app.engine.libplctag_driver import CPU_TYPES, DATA_TYPES, PATH_HELP, PROTOCOLS
 from app.engine.plc_drivers import DEFAULT_PORTS, DEFAULT_SLOTS, DRIVER_MAP, TAG_EXAMPLES
 from app.theme import sheet
+from app.engine.tagspec import FORMATS, SpecError, TagSpec, member_names, parse_shorthand, specs_from
 from app.ui import widgets as w
 from app.ui.pages.base import Page
 
@@ -62,32 +63,60 @@ class TagModel(QAbstractTableModel):
 
     # --- structure
     def columns(self) -> list[str]:
-        return (["Tag", "Type", "Value", "Last changed", "Changes"] if self.typed
-                else ["Tag", "Value", "Last changed", "Changes"])
+        return (["Tag", "Type", "Read as", "Value", "Last changed", "Changes"] if self.typed
+                else ["Tag", "Read as", "Value", "Last changed", "Changes"])
+
+    @staticmethod
+    def _row(spec: TagSpec) -> dict:
+        return {"spec": spec, "value": "", "changed": "", "count": 0, "lit": 0.0,
+                "error": False}
 
     def load(self, entries: list[dict], typed: bool) -> None:
         self.beginResetModel()
         self.typed = typed
-        self.rows = [{"tag": e["tag"], "dtype": e.get("dtype", "DINT"), "value": "",
-                      "changed": "", "count": 0, "lit": 0.0, "error": False}
-                     for e in entries if e.get("tag")]
+        self.rows = [self._row(spec) for spec in specs_from(entries)]
         self._reindex()
         self.endResetModel()
 
     def entries(self) -> list[dict]:
-        return [{"tag": r["tag"], "dtype": r["dtype"]} for r in self.rows]
+        return [r["spec"].to_entry() for r in self.rows]
+
+    def specs(self) -> list[TagSpec]:
+        return [r["spec"] for r in self.rows]
 
     def _reindex(self) -> None:
-        self._index = {r["tag"]: i for i, r in enumerate(self.rows)}
+        # Live values arrive by the name a tag is logged under.
+        self._index = {r["spec"].key: i for i, r in enumerate(self.rows)}
 
-    def add(self, tag: str, dtype: str) -> bool:
-        if tag in self._index:
+    def add(self, spec, dtype: str | None = None) -> bool:
+        if not isinstance(spec, TagSpec):
+            spec = TagSpec(address=str(spec))
+        if dtype:
+            spec.dtype = dtype
+        if spec.key in self._index:
             return False
         self.beginInsertRows(QModelIndex(), len(self.rows), len(self.rows))
-        self.rows.append({"tag": tag, "dtype": dtype, "value": "", "changed": "",
-                          "count": 0, "lit": 0.0, "error": False})
+        self.rows.append(self._row(spec))
         self._reindex()
         self.endInsertRows()
+        return True
+
+    def replace(self, rows: list[int], spec: TagSpec) -> bool:
+        """Put `spec` where `rows` were -- an edit, or several registers
+        combined into one grouped tag. False if its name is taken by a row
+        not being replaced."""
+        rows = sorted(set(rows))
+        owner = self._index.get(spec.key)
+        if owner is not None and owner not in rows:
+            return False
+        self.beginResetModel()
+        first = rows[0]
+        for i in reversed(rows):
+            del self.rows[i]
+        self.rows.insert(first, self._row(spec))
+        self._reindex()
+        self.endResetModel()
+        self.edited.emit()
         return True
 
     def remove(self, indexes: list[int]) -> None:
@@ -146,8 +175,21 @@ class TagModel(QAbstractTableModel):
         return None
 
     def _key(self, column: int) -> str:
-        return {"Tag": "tag", "Type": "dtype", "Value": "value", "Last changed": "changed",
-                "Changes": "count"}[self.columns()[column]]
+        return {"Tag": "tag", "Type": "dtype", "Read as": "readas", "Value": "value",
+                "Last changed": "changed", "Changes": "count"}[self.columns()[column]]
+
+    @staticmethod
+    def _field(r: dict, key: str):
+        spec = r["spec"]
+        if key == "tag":
+            return spec.key
+        if key == "dtype":
+            return spec.dtype
+        if key == "readas":
+            # Blank for an ordinary tag: the column only speaks up for a
+            # named or grouped one, where the name is not the address.
+            return spec.describe() if (spec.grouped or spec.name) else ""
+        return r[key]
 
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid():
@@ -156,7 +198,7 @@ class TagModel(QAbstractTableModel):
         key = self._key(index.column())
         t = sheet.tokens()
         if role in (Qt.DisplayRole, Qt.EditRole):
-            value = r[key]
+            value = self._field(r, key)
             if key == "value" and value == "":
                 return "waiting" if role == Qt.DisplayRole else ""
             if key == "count":
@@ -167,7 +209,7 @@ class TagModel(QAbstractTableModel):
                 return QColor(t["down"])
             if key == "value" and r["value"] == "":
                 return QColor(t["txt_2"])
-            if key in ("changed", "count", "dtype"):
+            if key in ("changed", "count", "dtype", "readas"):
                 return QColor(t["txt_1"])
         if role == Qt.BackgroundRole and r["lit"]:
             age = time.monotonic() - r["lit"]
@@ -184,11 +226,14 @@ class TagModel(QAbstractTableModel):
             return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.ToolTipRole and key == "value" and r["error"]:
             return r["value"]
+        if role == Qt.ToolTipRole and key in ("tag", "readas"):
+            return r["spec"].describe() + "\nDouble-click Read as (or press Edit...) to change it."
         return None
 
     def flags(self, index):
         base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        if self._key(index.column()) in ("tag", "dtype"):
+        key = self._key(index.column())
+        if key == "tag" or (key == "dtype" and not self.rows[index.row()]["spec"].grouped):
             return base | Qt.ItemIsEditable
         return base
 
@@ -200,14 +245,21 @@ class TagModel(QAbstractTableModel):
         if not text:
             return False
         r = self.rows[index.row()]
+        spec = r["spec"]
         if key == "tag":
-            if text != r["tag"] and text in self._index:
+            if text != spec.key and text in self._index:
                 return False
-            r["tag"] = text
+            if spec.grouped or spec.name:
+                # A named or grouped tag: the text is its name. Typing the
+                # plain form back clears the name.
+                plain = TagSpec(spec.address, spec.count).key
+                spec.name = "" if text == plain else text
+            else:
+                spec.address = text
             r.update(value="", changed="", count=0)
             self._reindex()
         elif key == "dtype":
-            r["dtype"] = text.upper()
+            spec.dtype = text.upper()
         self.dataChanged.emit(self.index(index.row(), 0),
                               self.index(index.row(), self.columnCount() - 1))
         self.edited.emit()
@@ -375,11 +427,14 @@ class TagsPage(Page):
         add = w.button("Add", icon_name="plus", slot=self._add)
         remove = w.button("Remove", icon_name="minus", slot=self._remove,
                           tip="Remove the selected tags")
+        edit = w.button("Edit...", slot=self._edit,
+                        tip="Name the selected tag, or read it as text or a number over several "
+                            "registers. Select several consecutive registers to combine them.")
         import_btn = w.button("Import...", slot=self._import,
-                              tip="Add tags from a Studio 5000 L5X or tag CSV export, or any "
-                                  "CSV or text list of tag names")
-        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, remove, import_btn,
-                                        stretch_at=0))
+                              tip="Add tags from a GX Works3 project (.gx3), a Studio 5000 L5X "
+                                  "or tag CSV export, or any CSV or text list of tag names")
+        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, remove, edit,
+                                        import_btn, stretch_at=0))
         self.example = w.label("", "hint", wrap=True)
         table_card.body.addWidget(self.example)
 
@@ -388,6 +443,9 @@ class TagsPage(Page):
         self.table.setModel(self.model)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
+        # Read as is not edited in place: a double-click there opens the editor.
+        self.table.doubleClicked.connect(
+            lambda index: self._edit() if self.model._key(index.column()) == "readas" else None)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
@@ -432,7 +490,7 @@ class TagsPage(Page):
                 if isinstance(item, str):
                     entries.append({"tag": item, "dtype": "DINT"})
                 elif isinstance(item, dict) and item.get("tag"):
-                    entries.append({"tag": item["tag"], "dtype": item.get("dtype", "DINT")})
+                    entries.append(dict(item))
             self._tags[key] = entries
         kind = plc.get("type", PYCOMM3)
         if kind not in DRIVER_MAP:
@@ -585,13 +643,50 @@ class TagsPage(Page):
     # --------------------------------------------------------------- tags
 
     def _add(self) -> None:
-        tag = self.new_tag.text().strip()
-        if not tag:
+        text = self.new_tag.text().strip()
+        if not text:
             return
-        if not self.model.add(tag, self.new_type.currentText()):
-            self.session.status.emit(f"{tag} is already in the list.")
+        try:
+            spec = parse_shorthand(text)
+        except SpecError as exc:
+            self.session.status.emit(str(exc))
+            return
+        if not self.model.add(spec, self.new_type.currentText()):
+            self.session.status.emit(f"{spec.key} is already in the list.")
             return
         self.new_tag.clear()
+
+    def _edit(self) -> None:
+        """Edit the selected tag; with several consecutive registers selected,
+        offer them combined into one grouped tag."""
+        from app.ui.tagedit import TagEditDialog
+        rows = sorted(i.row() for i in self.table.selectionModel().selectedRows())
+        if not rows:
+            self.session.status.emit("Select a tag to edit, or several registers to combine.")
+            return
+        specs = [self.model.rows[i]["spec"] for i in rows]
+        if len(specs) == 1:
+            spec = TagSpec(**vars(specs[0]))
+            title = f"Edit {spec.key}"
+        else:
+            first = specs[0]
+            names = member_names(first.address, len(specs))
+            if (any(s.grouped for s in specs)
+                    or names != [s.address for s in specs]):
+                w.info(self, "Combine registers",
+                       "Only consecutive single registers can be combined.",
+                       "Select, say, D1916, D1917, D1918 and D1919 -- in order, none of them "
+                       "grouped already.")
+                return
+            spec = TagSpec(address=first.address, count=len(specs), fmt="ascii",
+                           dtype=first.dtype)
+            title = f"Combine {len(specs)} registers"
+        dialog = TagEditDialog(spec, title, self.model.typed, self)
+        if not dialog.exec():
+            return
+        new = dialog.spec()
+        if not self.model.replace(rows, new):
+            w.error(self, "Edit tag", f"There is already a tag called {new.key}.")
 
     def _import(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -601,7 +696,7 @@ class TagsPage(Page):
 
         path, _ = QFileDialog.getOpenFileName(
             self, "Import tags", "",
-            "Tag lists (*.L5X *.l5x *.csv *.txt);;All files (*)")
+            "Tag lists (*.gx3 *.L5X *.l5x *.csv *.txt);;All files (*)")
         if not path:
             return
         try:
@@ -609,14 +704,15 @@ class TagsPage(Page):
         except TagImportError as exc:
             w.error(self, "Import tags", "No tags were imported.", str(exc))
             return
-        existing = {e["tag"] for e in self.model.entries()}
+        existing = {r["spec"].key for r in self.model.rows} | {
+            r["spec"].address for r in self.model.rows if not r["spec"].grouped}
         dialog = TagPickerDialog(entries, existing, os.path.basename(path), self)
         if not dialog.exec():
             return
         added = 0
         for entry in dialog.chosen():
             dtype = entry.dtype.upper() if entry.dtype.upper() in DATA_TYPES else self.new_type.currentText()
-            if self.model.add(entry.tag, dtype):
+            if self.model.add(entry.spec(dtype)):
                 added += 1
         self.session.status.emit(f"Added {added} tag{'s' if added != 1 else ''} from "
                                  f"{os.path.basename(path)}")

@@ -41,7 +41,7 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
     from app import paths
     from app.engine.config_manager import ConfigManager
     from app.engine.event_log import EV_INFO, EV_PLC_ERROR, EventLogger
-    from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, tags_for
+    from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, specs_for
     from app.engine.plc_poller import PLCPoller
 
     from app.engine import profiles
@@ -85,7 +85,7 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
 
     # --- PLC, retried until it answers or we are told to stop. ---
     plc_poller: PLCPoller | None = None
-    tags = tags_for(cfg.plc)
+    tags = specs_for(cfg.plc)
     want_plc = bool(cfg.plc.get("enabled")) and bool(tags)
     if cfg.plc.get("enabled") and not tags:
         log.warning("PLC polling is enabled but there are no tags for %s.", cfg.plc.get("type"))

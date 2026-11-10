@@ -11,6 +11,7 @@ Each driver exposes:
   disconnect()
   read_tag(tag)     -> (value, error_str | None)
   read_tags(tags)   -> {tag: (value, error_str | None[, seen_ns])}
+  read_block(address, count) -> (list of 16-bit register values | None, error_str | None)
   is_connected()    -> bool
 """
 
@@ -83,6 +84,13 @@ class PLCDriver:
             value, err = self.read_tag(tag)
             out[tag] = (value, err, clock.now_ns())
         return out
+
+    def read_block(self, address: str, count: int) -> tuple[list[int] | None, str | None]:
+        """`count` consecutive 16-bit registers from `address`, in ONE request
+        so they all come from the same PLC scan -- the point of a grouped
+        tag. A driver that cannot do that says so rather than reading them
+        one by one and handing back a mixture."""
+        return None, f"{self.PLC_TYPE} cannot read grouped tags."
 
     def is_connected(self) -> bool:
         return False
@@ -194,6 +202,30 @@ class RockwellDriver(PLCDriver):
             else:
                 out[tag] = (result.value, None)
         return out
+
+    def read_block(self, address: str, count: int):
+        """An array slice, `Data[16]` x4, in one request: pycomm3's
+        `Data[16]{4}` element-count syntax. INT/SINT/DINT elements come back
+        as their low 16 bits each; a grouped tag on a Logix PLC is for INT
+        arrays holding text or split numbers, as other vendors' PLCs send them."""
+        if not self._plc:
+            return None, "Not connected"
+        try:
+            result = self._plc.read(f"{address}{{{count}}}" if count > 1 else address)
+        except Exception as e:
+            return None, str(e)
+        if result is None:
+            return None, f"Tag '{address}' not found"
+        if result.error:
+            return None, f"{result.error}  (tag: {address})"
+        values = result.value if isinstance(result.value, list) else [result.value]
+        try:
+            words = [int(v) & 0xFFFF for v in values]
+        except (TypeError, ValueError):
+            return None, f"'{address}' is not an array of integers"
+        if len(words) != count:
+            return None, f"Asked for {count} elements of '{address}', got {len(words)}"
+        return words, None
 
     def is_connected(self) -> bool:
         return self._plc is not None
@@ -436,6 +468,25 @@ class SiemensDriver(PLCDriver):
         except Exception as e:
             return None, str(e)
 
+    def read_block(self, address: str, count: int):
+        """`DB10,WORD4` (or INT) x count: 2*count bytes of the DB in one
+        request. Siemens stores words high byte first."""
+        if not self._client:
+            return None, "Not connected"
+        import re as _re
+        m = _re.match(r"^DB(\d+),(?:WORD|INT)(\d+)$", address.strip().upper())
+        if not m:
+            return None, ("A grouped Siemens tag starts at a word in a DB: DB10,WORD4 or "
+                          "DB10,INT4.")
+        try:
+            data = self._client.db_read(int(m.group(1)), int(m.group(2)), 2 * count)
+        except Exception as e:
+            return None, str(e)
+        data = bytes(data)
+        if len(data) < 2 * count:
+            return None, f"The PLC returned {len(data)} bytes, {2 * count} needed"
+        return [int.from_bytes(data[i:i + 2], "big") for i in range(0, 2 * count, 2)], None
+
     def is_connected(self) -> bool:
         if self._client is None:
             return False
@@ -589,6 +640,32 @@ class MitsubishiDriver(PLCDriver):
         except Exception as e:
             return None, f"Read error for '{tag}': {e}"
 
+    #: Word devices a block can start at. A bit device read as words packs
+    #: 16 bits per word, which is not what a grouped tag means.
+    WORD_DEVICES = {"D", "W", "R", "ZR", "SD", "SW", "TN", "CN", "CS", "STN"}
+
+    def read_block(self, address: str, count: int):
+        """`count` word devices from `address` with one batch read (3E frame:
+        up to 960 words), so a VIN in D1916-D1919 cannot come back half
+        from one scan and half from the next."""
+        if not self._comm:
+            return None, "Not connected"
+        import re as _re
+        head = address.strip().upper()
+        m = _re.match(r"^([A-Z]+)[0-9A-F]+$", head)
+        if not m or m.group(1) not in self.WORD_DEVICES:
+            return None, (f"A grouped tag starts at a word device (D, W, R, ZR, SD...), "
+                          f"not '{address}'.")
+        if not 1 <= count <= 960:
+            return None, "A grouped tag is 1 to 960 registers."
+        try:
+            values = self._comm.batchread_wordunits(headdevice=head, readsize=count)
+        except Exception as e:
+            return None, f"Read error for '{address}' x{count}: {e}"
+        if len(values) != count:
+            return None, f"Asked for {count} registers at {address}, got {len(values)}"
+        return [int(v) & 0xFFFF for v in values], None
+
     def is_connected(self) -> bool:
         return self._comm is not None
 
@@ -621,8 +698,10 @@ DEFAULT_SLOTS = {
 TAG_EXAMPLES = {
     "Rockwell (pycomm3)":   "Motor_Running  |  Conveyor_Speed  |  Program:Main.Counter  |  MyUDT.Member",
     "Rockwell (libplctag)": "Motor_Running  |  Conveyor_Speed  |  MyArray[0]  |  MyUDT.Member",
-    "Siemens (snap7)":      "DB10,X0.0  |  DB10,REAL4  |  DB10,DINT4  |  M0.0  |  Q0.0",
-    "Mitsubishi (MC Proto)": "D100  |  M200  |  Y0  |  X0  |  CN0  |  CC0  |  TN0  |  D100.5 (bit 5 of D100)",
+    "Siemens (snap7)":      "DB10,X0.0  |  DB10,REAL4  |  DB10,DINT4  |  M0.0  |  Q0.0  |  "
+                            "DB10,WORD20 x4 ascii (4 words as text)",
+    "Mitsubishi (MC Proto)": "D100  |  M200  |  Y0  |  CN0  |  D100.5 (bit 5)  |  "
+                             "D1916 x4 ascii (4 registers as text)  |  D200 int32",
 }
 
 

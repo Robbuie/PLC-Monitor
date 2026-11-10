@@ -44,7 +44,8 @@ app/
     monitors.py      THE way a config becomes a driver / socket monitor -- window and service both
     profiles.py      profiles (ProgramData\profiles\*.json), the service pointer, first-run migration
     clock.py         the precise wall clock every row is stamped with
-    tagimport.py     L5X / tag CSV / plain list -> tag entries
+    tagimport.py     GX Works3 .gx3 / L5X / tag CSV / plain list -> tag entries
+    tagspec.py       one tag-list entry: address, xN registers, format, name; decoding
     headless.py      the unattended runner (retries the PLC every 15 s)
     logdata.py       reading logs back: trend series, latency pairing
     robdata.py       reading RobControl's trend recording (SQLite, read-only) for the Trend page
@@ -52,7 +53,7 @@ app/
   core/              no widgets. settings.py (ui.json), updates.py, themeswitch.py, siblings.py
   theme/             tokens.py (copied from File Manager), qss.py (copied), sheet.py (ours)
   ui/                window, titlebar, rail, widgets, appearance, guide, session, pages/,
-                     profiles_ui (switcher, details, Manage), tagpicker
+                     profiles_ui (switcher, details, Manage), tagpicker, tagedit
 packaging/           build.py, plcmonitor.spec, installer.iss, icon.py
 tools/preview.py     offscreen screenshots with a made-up log
 tests/
@@ -73,6 +74,11 @@ headless_runner.py   kept for old shortcuts
   keeps the block that is on disk. The file name is the id and never changes.
   The service runs the profile named in `ProgramData\service.json`; the window
   opens the one last used (ui.json `profile`).
+- A tag is a TagSpec (engine/tagspec.py). A grouped one is read with the
+  driver's `read_block` -- one request, so one PLC scan -- and decoded in the
+  poller; it is logged under `spec.key` (its name, else `D1916 x4`). Never
+  read a group's registers one by one and stitch them: that is the torn-read
+  bug grouping exists to fix.
 - The logger writes on its own thread. Anything that reads the file right
   after logging (tests, mostly) calls `logger.flush()` first.
 

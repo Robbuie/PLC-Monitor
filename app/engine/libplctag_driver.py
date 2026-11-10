@@ -476,6 +476,29 @@ class LibPlcTagDriver(PLCDriver):
         except Exception:
             pass
 
+    def read_block(self, address: str, count: int):
+        """`count` INT elements from `address` (an array element such as
+        `Data[16]`) in one read, through one handle made for the block."""
+        if not self._connected or not self._lib:
+            return None, "Not connected"
+        key = f"{address}#block{count}"
+        tid = self._tag_ids.get(key)
+        if tid is None:
+            attribs = self.cfg.build_attrib(address, "INT").replace(
+                f"elem_count={self.cfg.elem_count}", f"elem_count={count}")
+            tid = self._lib.plc_tag_create(attribs.encode("utf-8"), self.cfg.timeout_ms)
+            if tid < 0:
+                return None, f"plc_tag_create failed: {_decode_error(self._lib, tid)}"
+            self._tag_ids[key] = tid
+        rc = self._lib.plc_tag_read(tid, self.cfg.timeout_ms)
+        if rc != PLCTAG_STATUS_OK:
+            self._forget(tid, key)
+            return None, f"Read error: {_decode_error(self._lib, rc)}"
+        size = self._lib.plc_tag_get_size(tid)
+        if size < 2 * count:
+            return None, f"The PLC returned {max(size, 0)} bytes, {2 * count} needed"
+        return [self._lib.plc_tag_get_uint16(tid, 2 * i) for i in range(count)], None
+
     def _type_of(self, tag: str) -> str:
         return self.tag_types.get(tag, self.cfg.data_type)
 

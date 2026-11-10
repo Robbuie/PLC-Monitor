@@ -43,7 +43,7 @@ class _Filter(QSortFilterProxyModel):
         if self.basic_only and not entry.basic:
             return False
         if self.text:
-            hay = f"{entry.tag} {entry.dtype} {entry.description}".lower()
+            hay = f"{entry.tag} {entry.label} {entry.kind} {entry.description}".lower()
             return self.text in hay
         return True
 
@@ -71,16 +71,17 @@ class TagPickerDialog(QDialog):
                               stretch_at=0))
 
         self.model = QStandardItemModel(0, 3, self)
-        self.model.setHorizontalHeaderLabels(["Tag", "Type", "Description"])
+        self.model.setHorizontalHeaderLabels(["Tag", "Address / type", "Description"])
         for entry in entries:
-            name = QStandardItem(entry.tag)
+            name = QStandardItem(entry.label)
             name.setData(entry, Qt.UserRole)
             name.setCheckable(True)
             name.setEditable(False)
-            if entry.tag in existing:
+            if entry.label in existing or (entry.count == 1 and not entry.name
+                                           and entry.tag in existing):
                 name.setEnabled(False)
                 name.setToolTip("Already in the list")
-            kind = QStandardItem(entry.dtype)
+            kind = QStandardItem(entry.kind)
             kind.setEditable(False)
             desc = QStandardItem(entry.description)
             desc.setEditable(False)

@@ -23,7 +23,7 @@ from app import paths
 from app.engine import profiles
 from app.engine.config_manager import ConfigManager
 from app.engine.event_log import EventLogger
-from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, describe_socket, tags_for
+from app.engine.monitors import ConfigError, build_driver, build_socket_monitor, describe_socket, specs_for
 from app.engine.plc_poller import PLCPoller
 
 
@@ -107,6 +107,23 @@ class Session(QObject):
         profile = self.profile
         return profile.label if profile else os.path.basename(self.cfg.path)
 
+    def group_specs(self) -> list:
+        """Every grouped tag in the open profile, whichever PLC family it is
+        under: used to decode logs that recorded the registers one by one."""
+        from app.engine.tagspec import specs_from
+        found = []
+        for entries in (self.cfg.plc.get("tags_per_driver") or {}).values():
+            found += [spec for spec in specs_from(entries) if spec.grouped]
+        return found
+
+    @staticmethod
+    def log_rows(path: str, specs: list):
+        """A log's rows, with grouped tags decoded where the log has their
+        registers one per row. Safe from a worker thread: `specs` is taken
+        on the UI thread with group_specs()."""
+        from app.engine import logdata
+        return logdata.with_groups(logdata.read_rows(path), specs)
+
     def open_config(self, path: str) -> None:
         """Make another profile (or config file) the open one.
 
@@ -155,7 +172,7 @@ class Session(QObject):
         if self.plc_poller is not None:
             return
         plc = self.cfg.plc
-        tags = tags_for(plc)
+        tags = specs_for(plc)
         if not tags:
             self.plcState.emit("error", "Add at least one tag to watch.")
             return
@@ -220,7 +237,7 @@ class Session(QObject):
 
     def update_tags(self) -> None:
         if self.plc_poller is not None:
-            self.plc_poller.update_tags(tags_for(self.cfg.plc))
+            self.plc_poller.update_tags(specs_for(self.cfg.plc))
 
     # -------------------------------------------------------------- socket
 

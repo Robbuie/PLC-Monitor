@@ -11,6 +11,7 @@ from typing import Callable
 from app.engine.event_log import EventLogger, EV_PLC_CHANGED, EV_PLC_ERROR, EV_PLC_CONNECTED, EV_PLC_DISC, EV_INFO
 from app.engine import clock
 from app.engine.plc_drivers import PLCDriver
+from app.engine.tagspec import SpecError, TagSpec
 
 #: Marks a tag that has not been read yet. A sentinel object rather than a
 #: string, so a PLC string tag whose value happens to be that text still logs.
@@ -24,14 +25,15 @@ RECONNECT_BACKOFF_S = (2.0, 5.0, 10.0, 15.0)
 
 
 class PLCPoller:
-    def __init__(self, driver: PLCDriver, tags: list[str], poll_ms: int,
+    def __init__(self, driver: PLCDriver, tags: list, poll_ms: int,
                  logger: EventLogger,
                  status_cb: Callable[[str], None] | None = None,
                  tag_update_cb: Callable[[str, object], None] | None = None,
                  state_cb: Callable[[str, str], None] | None = None):
         """
         driver        – connected PLCDriver instance
-        tags          – list of tag name strings to monitor
+        tags          – the tags to monitor: TagSpec objects, or plain
+                        address strings (each one register, as read)
         poll_ms       – polling interval in milliseconds
         logger        – EventLogger instance
         status_cb     – called with status strings (for GUI status bar)
@@ -40,7 +42,7 @@ class PLCPoller:
                         reconnects after losing the PLC, and when it is back
         """
         self.driver       = driver
-        self.tags         = list(tags)
+        self.specs        = _as_specs(tags)
         self.poll_ms      = poll_ms
         self.logger       = logger
         self.status_cb    = status_cb or (lambda m: None)
@@ -73,14 +75,20 @@ class PLCPoller:
             self._thread.join(timeout=5)
             self._thread = None
 
-    def update_tags(self, tags: list[str]):
+    @property
+    def tags(self) -> list[str]:
+        """The names the tags are logged under."""
+        return [spec.key for spec in self.specs]
+
+    def update_tags(self, tags: list):
         """Hot-update the tag list without restarting."""
-        # Remove stale entries
+        specs = _as_specs(tags)
+        keys = {spec.key for spec in specs}
         for t in list(self._last_values.keys()):
-            if t not in tags:
+            if t not in keys:
                 del self._last_values[t]
                 self._last_seen_ns.pop(t, None)
-        self.tags = list(tags)
+        self.specs = specs
 
     def update_poll_ms(self, poll_ms: int):
         self.poll_ms = poll_ms
@@ -120,30 +128,14 @@ class PLCPoller:
         instead of one per tag, which shortens the poll and with it the window
         in which a change can hide.
         """
-        tags = list(self.tags)
-        if not tags:
+        specs = list(self.specs)
+        if not specs:
             return 0, 0
         good = bad = 0
-        reader = getattr(self.driver, "read_tags", None)
-        if reader is not None:
-            results = reader(tags)
-        else:  # a driver from outside this module that only reads one at a time
-            results = {}
-            for tag in tags:
-                value, err = self.driver.read_tag(tag)
-                results[tag] = (value, err, clock.now_ns())
-        # Stamped when the answer came back: that is when this program learnt
-        # of the value, the same moment every other row in the log is stamped
-        # by. A batch shares one stamp; a driver that reads tag by tag gives
-        # each its own (the optional third item), so the first tag of a slow
-        # poll is not stamped as late as the last.
-        batch_ns = clock.now_ns()
-
-        for tag in tags:
+        for spec, value, err, seen_ns in self._read_all(specs):
             if self._stop_event.is_set():
                 break
-            value, err, *stamp = results.get(tag, (None, "No answer for this tag"))
-            seen_ns = stamp[0] if stamp and stamp[0] else batch_ns
+            tag = spec.key
 
             if err:
                 count = self._error_counts.get(tag, 0) + 1
@@ -178,7 +170,10 @@ class PLCPoller:
                                 old_value=old,
                                 new_value=value,
                                 ts_ns=seen_ns,
-                                window_ms=window)
+                                window_ms=window,
+                                # Where a named or grouped tag came from, so
+                                # the log stands on its own.
+                                notes=spec.describe() if (spec.grouped or spec.name) else "")
                 self._last_values[tag] = value
         return good, bad
 
@@ -205,17 +200,60 @@ class PLCPoller:
         elif now - self._failing_since >= RECONNECT_AFTER_S:
             self._reconnect(plc_label)
 
-    def _probe(self) -> tuple[bool, str]:
-        tags = list(self.tags)
-        reader = getattr(self.driver, "read_tags", None)
-        try:
+    def _read_all(self, specs: list[TagSpec]) -> list[tuple]:
+        """[(spec, value, error, seen_ns)] for every tag, in list order.
+
+        Single tags go to the driver as one batch: a driver that can put them
+        in one request (pycomm3, libplctag) answers in one network round trip
+        instead of one per tag. A grouped tag is one block read -- its
+        registers in one request, so they come from the same PLC scan -- and
+        is decoded here.
+
+        Stamped when the answer came back: that is when this program learnt
+        of the value, the same moment every other row in the log is stamped
+        by. A batch shares one stamp; a driver that reads tag by tag gives
+        each its own (the optional third item), so the first tag of a slow
+        poll is not stamped as late as the last.
+        """
+        plain = [s for s in specs if not s.grouped]
+        results: dict[str, tuple] = {}
+        if plain:
+            addresses = list(dict.fromkeys(s.address for s in plain))
+            reader = getattr(self.driver, "read_tags", None)
             if reader is not None:
-                results = reader(tags)
-            else:
-                results = {t: self.driver.read_tag(t) for t in tags}
+                results = reader(addresses)
+            else:  # a driver from outside this module that only reads one at a time
+                for address in addresses:
+                    value, err = self.driver.read_tag(address)
+                    results[address] = (value, err, clock.now_ns())
+        batch_ns = clock.now_ns()
+        out = []
+        block = getattr(self.driver, "read_block", None)
+        for spec in specs:
+            if not spec.grouped:
+                value, err, *stamp = results.get(spec.address, (None, "No answer for this tag"))
+                out.append((spec, value, err, stamp[0] if stamp and stamp[0] else batch_ns))
+                continue
+            if block is None:
+                out.append((spec, None, "This PLC driver cannot read grouped tags.", clock.now_ns()))
+                continue
+            words, err = block(spec.address, spec.count)
+            seen = clock.now_ns()
+            value = None
+            if not err:
+                try:
+                    value = spec.decode(words)
+                except (SpecError, ValueError, TypeError) as exc:
+                    err = f"Could not decode {spec.describe()}: {exc}"
+            out.append((spec, value, err, seen))
+        return out
+
+    def _probe(self) -> tuple[bool, str]:
+        try:
+            results = self._read_all(list(self.specs))
         except Exception as exc:
             return False, str(exc)
-        errors = [r[1] for r in results.values() if r[1]]
+        errors = [r[2] for r in results if r[2]]
         if len(errors) < len(results):
             return True, ""
         first = (errors[0] if errors else "no answer").splitlines()[0]
@@ -267,3 +305,7 @@ class PLCPoller:
             pause = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
             attempt += 1
             self._stop_event.wait(pause)
+
+
+def _as_specs(tags) -> list[TagSpec]:
+    return [t if isinstance(t, TagSpec) else TagSpec(address=str(t)) for t in tags or []]

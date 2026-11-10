@@ -3,6 +3,26 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.5.0] - 2026-11-10
+
+Values that span registers, read as what they are.
+
+- Grouped tags: several consecutive registers read in one request and
+  decoded as text (a VIN), INT16/UINT16, INT32/UINT32, REAL, BCD or hex,
+  with byte and word order. Type "D1916 x4 ascii" in the Add box, or select
+  registers and Edit... to combine them. One request means one PLC scan: no
+  more half-written values.
+- Names: any tag can be named ("Plant VIN"); the log, Trend and Latency use
+  the name, and the notes column says which registers it came from.
+- Import from GX Works3 (.gx3): global labels with their comments, and
+  grouped tags suggested from array element comments.
+- Latency matched by value: pair each trigger with the response that carries
+  the same value -- a VIN from arrival to send-out -- with several in flight
+  at once. "Changes to" also takes !value (anything but).
+- Older logs decoded: Trend and Latency apply the profile's grouped tags to
+  logs that recorded the registers one per row.
+- The Mitsubishi simulator in tools/ now plays VINs through D1916 and D1000.
+
 ## [1.4.2] - 2026-11-10
 
 - Fixed: the Trend and Latency charts were missing from the installed build

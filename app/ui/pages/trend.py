@@ -284,10 +284,12 @@ class TrendPage(Page):
             return
         self.tag_note.setText("Reading tag names...")
         include_bool = True
+        specs = self.session.group_specs()
 
         def work():
             try:
-                tags = logdata.numeric_tags(logdata.read_rows(path), include_bool=include_bool)
+                tags = logdata.numeric_tags(self.session.log_rows(path, specs),
+                                            include_bool=include_bool)
             except OSError:
                 tags = []
             self._tags_found.emit(tags)
@@ -479,6 +481,7 @@ class TrendPage(Page):
         db = self.robot_source.currentData()
         start, end, label = self._window()
         names = tags + [signal.name for signal in robots]
+        specs = self.session.group_specs()
         self._loading = True
         self.chart_status.setText("Loading...")
 
@@ -486,7 +489,8 @@ class TrendPage(Page):
             data: dict = {}
             if tags:
                 try:
-                    data.update(logdata.series(logdata.read_rows(path), tags, start, end))
+                    data.update(logdata.series(self.session.log_rows(path, specs), tags,
+                                               start, end))
                 except OSError as exc:
                     data["__error__"] = str(exc)
             if robots:

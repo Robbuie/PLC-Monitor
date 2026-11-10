@@ -144,7 +144,7 @@ class Matcher:
     """Which rows count as the trigger, or as the response.
 
     `kind` "plc": a PLC_CHANGED row for `tag`, optionally only when the new
-    value equals `value`. `kind` "socket": a SOCK_RECV or SOCK_SENT row (or
+    value equals `value` (or, written `!value`, is anything but it). `kind` "socket": a SOCK_RECV or SOCK_SENT row (or
     both), optionally only from `source` and only when the payload text or hex
     contains `contains`.
     """
@@ -163,8 +163,15 @@ class Matcher:
                 return False
             if self.tag and (row.get("tag_or_addr") or "").strip() != self.tag:
                 return False
-            if self.value != "" and (row.get("new_value") or "").strip() != self.value:
-                return False
+            if self.value != "":
+                new = (row.get("new_value") or "").strip()
+                # "!0UNKNOWN": any value but that one -- a VIN register that
+                # shows a placeholder between vehicles.
+                if self.value.startswith("!"):
+                    if new == self.value[1:].strip():
+                        return False
+                elif new != self.value:
+                    return False
             return True
         if event not in self.events:
             return False
@@ -275,7 +282,8 @@ def _summary(row: dict) -> str:
 
 def measure(rows: Iterable[dict], trigger: Matcher, response: Matcher, *,
             window_ms: int = 5000,
-            start_ms: int | None = None, end_ms: int | None = None) -> LatencyResult:
+            start_ms: int | None = None, end_ms: int | None = None,
+            same_value: bool = False) -> LatencyResult:
     """Pair every trigger with the first response after it.
 
     A trigger with no response inside `window_ms` is kept as unanswered rather
@@ -305,6 +313,8 @@ def measure(rows: Iterable[dict], trigger: Matcher, response: Matcher, *,
             continue
         stamped.append((ms, index, is_trigger, is_response, row))
     stamped.sort(key=lambda item: (item[0], item[1]))
+    if same_value:
+        return _measure_by_value(stamped, window_ms)
 
     result = LatencyResult()
     open_pair: Pair | None = None
@@ -323,6 +333,162 @@ def measure(rows: Iterable[dict], trigger: Matcher, response: Matcher, *,
             result.pairs.append(pair)
             open_pair = pair
     return result
+
+
+def carries(row: dict, value: str) -> bool:
+    """Whether a row carries `value`: a tag that changed to it (or to text
+    containing it), or a socket message whose payload holds it as text."""
+    if not value:
+        return False
+    if row.get("event_type") == PLC_CHANGED:
+        return value in (row.get("new_value") or "")
+    if value in (row.get("notes") or ""):
+        return True
+    return value.encode("utf-8", "replace").hex() in (row.get("raw_hex") or "").lower()
+
+
+def _measure_by_value(stamped: list, window_ms: int) -> LatencyResult:
+    """Pair each trigger with the first later response carrying the SAME
+    value -- vehicle A1234567 arriving in one register and leaving in
+    another, or in a socket message. Triggers can overlap (several vehicles
+    in flight); each waits for its own value, up to `window_ms`, and a
+    response answers the oldest trigger still waiting for its value."""
+    result = LatencyResult()
+    waiting: list[tuple[Pair, str]] = []
+    for ms, _index, is_trigger, is_response, row in stamped:
+        waiting = [(p, v) for p, v in waiting if ms - p.trigger_ms <= window_ms]
+        if is_response and waiting:
+            for i, (pair, value) in enumerate(waiting):
+                if ms >= pair.trigger_ms and carries(row, value):
+                    pair.response_ms = ms
+                    pair.response_text = _summary(row)
+                    del waiting[i]
+                    break
+        if is_trigger:
+            value = (row.get("new_value") or "").strip()
+            if not value:
+                continue
+            pair = Pair(trigger_ms=ms, response_ms=None, trigger_text=_summary(row),
+                        trigger_window_ms=row_window(row) if row.get("event_type") == PLC_CHANGED
+                        else None)
+            result.pairs.append(pair)
+            waiting.append((pair, value))
+    return result
+
+
+# --------------------------------------------------------------------------
+# Grouped tags in logs made before the group existed
+# --------------------------------------------------------------------------
+
+
+def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]:
+    """Decode grouped tags in a log that recorded their registers one by one.
+
+    A log written before `D1916 x4 as Text` was set up has a row per register
+    -- D1916, D1917, ... -- and rebuilding the text row by row shows mixtures
+    (`A1NKNOWN`) as each register's row arrives. The rows of one poll are
+    written within a few milliseconds of each other, so registers changing
+    within `gap_ms` are taken together: one decoded row per poll, named as
+    the group is, in place of the register rows. A group's registers start
+    from the old value on their first row (the first read of a tag is not
+    logged as a change).
+
+    Rows of anything else pass through untouched, and a log that already has
+    the group's own rows is left alone.
+    """
+    from app.engine.tagspec import member_names
+
+    groups = []
+    owner: dict[str, int] = {}
+    for spec in specs or []:
+        if not spec.grouped:
+            continue
+        members = member_names(spec.address, spec.count)
+        if len(members) != spec.count or any(m in owner for m in members):
+            continue
+        state = {"spec": spec, "members": members, "words": {}, "pending": None,
+                 "last": None, "first_ms": None, "window": None, "source": ""}
+        for m in members:
+            owner[m] = len(groups)
+        groups.append(state)
+    if not groups:
+        yield from rows
+        return
+
+    def flush(g):
+        if g["pending"] is None:
+            return None
+        ms = g["pending"]
+        g["pending"] = None
+        if len(g["words"]) < len(g["members"]):
+            return None
+        try:
+            value = g["spec"].decode([g["words"][m] for m in g["members"]])
+        except Exception:
+            return None
+        text = str(value)
+        if text == g["last"]:
+            return None
+        old, g["last"] = g["last"], text
+        if old is None:
+            # The value before this poll is known only if every register's
+            # old value was: the first decoded value has no "from".
+            old = ""
+        spec = g["spec"]
+        return {"timestamp_ms": str(ms),
+                "timestamp_human": _human(ms),
+                "event_type": PLC_CHANGED, "source": g["source"], "tag_or_addr": spec.key,
+                "old_value": old, "new_value": text, "raw_hex": "",
+                "notes": f"decoded from {spec.describe()}",
+                "window_ms": "" if g["window"] is None else str(g["window"])}
+
+    for row in rows:
+        ms = row_ms(row)
+        due = []
+        if ms is not None:
+            for g in groups:
+                if g["pending"] is not None and ms - g["pending"] > gap_ms:
+                    out = flush(g)
+                    if out:
+                        due.append(out)
+        yield from due
+        tag = (row.get("tag_or_addr") or "").strip()
+        index = owner.get(tag)
+        if index is None or row.get("event_type") != PLC_CHANGED or ms is None:
+            yield row
+            continue
+        g = groups[index]
+        try:
+            new = int(float(row.get("new_value") or ""))
+        except ValueError:
+            yield row
+            continue
+        if tag not in g["words"]:
+            try:
+                g["words"][tag] = int(float(row.get("old_value") or ""))
+            except ValueError:
+                pass
+            if g["last"] is None and len(g["words"]) == len(g["members"]) and g["pending"] is None:
+                # Every register's starting value is known: that is the
+                # value the first change is "from".
+                try:
+                    g["last"] = str(g["spec"].decode([g["words"][m] for m in g["members"]]))
+                except Exception:
+                    pass
+        g["words"][tag] = new
+        g["source"] = row.get("source", "")
+        if g["pending"] is None:
+            g["window"] = row_window(row)
+        g["pending"] = ms
+    for g in groups:
+        out = flush(g)
+        if out:
+            yield out
+
+
+def _human(ms: int) -> str:
+    when = datetime.fromtimestamp(ms // 1000)
+    return f"{when:%Y-%m-%d %H:%M:%S}.{ms % 1000:03d}"
 
 
 def sources(rows: Iterable[dict]) -> tuple[list[str], list[str]]:

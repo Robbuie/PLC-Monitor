@@ -69,23 +69,24 @@ def build_driver(plc: dict) -> PLCDriver:
     )
 
 
-def tags_for(plc: dict) -> list[str]:
-    """The tag names for the selected driver.
+def specs_for(plc: dict) -> list:
+    """The tags for the selected driver, as TagSpecs (address, grouping,
+    format, name).
 
     `tags_per_driver` is the truth since per-driver lists arrived; `tags` is the
     older flat list, still read for a config that predates it.
     """
+    from app.engine.tagspec import specs_from
     kind = plc.get("type", "")
     per = (plc.get("tags_per_driver") or {}).get(kind)
     if per:
-        names = []
-        for item in per:
-            if isinstance(item, dict) and item.get("tag"):
-                names.append(str(item["tag"]))
-            elif isinstance(item, str) and item:
-                names.append(item)
-        return names
-    return [str(t) for t in plc.get("tags", []) if t]
+        return specs_from(per)
+    return specs_from([str(t) for t in plc.get("tags", []) if t])
+
+
+def tags_for(plc: dict) -> list[str]:
+    """The names the selected driver's tags are logged under."""
+    return [spec.key for spec in specs_for(plc)]
 
 
 def build_socket_monitor(sock: dict, logger: EventLogger,

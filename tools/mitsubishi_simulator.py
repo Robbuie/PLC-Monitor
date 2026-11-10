@@ -46,6 +46,8 @@ Test tags:
   M200  alarm (pulses every 30s)
   Y0    output (toggles every 3s)
   X0    input (follows Y0)
+  D1916 x4 ascii   VIN arriving (a new one every 4 s, "0UNKNOWN" between)
+  D1000 x4 ascii   the same VIN going out 1.5 s later, cleared after 300 ms
 """
 
 import socket
@@ -161,7 +163,37 @@ def _sim_loop():
             WORD_MEM["TN"][0] = int((t % 20) / 20 * 200)
             BIT_MEM["TC"][0]  = 1 if WORD_MEM["TN"][0] >= 150 else 0
 
+def _put_text(start: int, text: str) -> None:
+    """Text into D registers, two characters each, low byte first -- the
+    way an iQ-R stores a string."""
+    raw = text.encode("ascii").ljust(8, b"\x00")
+    for i in range(0, len(raw), 2):
+        WORD_MEM["D"][start + i // 2] = raw[i] | (raw[i + 1] << 8)
+
+
+def _vehicle_loop():
+    """A vehicle every 4 s, as at a vehicle line: its VIN arrives in
+    the plant packet (D1916-D1919, "0UNKNOWN" between vehicles), and a
+    moment later goes out in the send buffer (D1000-D1003), which is
+    cleared again 300 ms after. Try "D1916 x4 ascii" and "D1000 x4 ascii"."""
+    serial = 4567
+    while True:
+        vin = f"A123{serial:04d}"
+        with _lock:
+            _put_text(1916, vin)
+        time.sleep(1.5)
+        with _lock:
+            _put_text(1000, vin)
+        time.sleep(0.3)
+        with _lock:
+            _put_text(1000, "")
+            _put_text(1916, "0UNKNOWN")
+        time.sleep(2.2)
+        serial += 1
+
+
 threading.Thread(target=_sim_loop, daemon=True).start()
+threading.Thread(target=_vehicle_loop, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Frame constants

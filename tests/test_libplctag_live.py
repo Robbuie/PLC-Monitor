@@ -35,7 +35,8 @@ def _lib_path():
 def server():
     exe = os.path.join(DIR, "ab_server.exe" if sys.platform == "win32" else "ab_server")
     proc = subprocess.Popen([exe, "--plc=ControlLogix", "--path=1,0", "--tag=Go:DINT[1]",
-                             "--tag=Speed:REAL[1]", "--tag=Count:DINT[1]"],
+                             "--tag=Speed:REAL[1]", "--tag=Count:DINT[1]",
+                             "--tag=Packet:INT[8]"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     deadline = time.time() + 5
     while time.time() < deadline:
@@ -92,4 +93,22 @@ def test_the_poller_logs_a_change_with_its_window(server, tmp_path):
     assert [(c["tag_or_addr"], c["old_value"], c["new_value"]) for c in changes] == [("Go", "0", "1")]
     assert int(changes[0]["window_ms"]) >= 40
     writer.disconnect()
+    drv.disconnect()
+
+
+def test_an_int_array_block(server):
+    import ctypes
+    drv = driver()
+    lib = drv._lib
+    lib.plc_tag_set_int16.argtypes = [ctypes.c_int32, ctypes.c_int, ctypes.c_int16]
+    lib.plc_tag_write.argtypes = [ctypes.c_int32, ctypes.c_int]
+    attribs = drv.cfg.build_attrib("Packet", "INT").replace("elem_count=1", "elem_count=8")
+    tid = lib.plc_tag_create(attribs.encode(), 800)
+    for i, w in enumerate([0, 0, 12609, 13106, 13620, 14134, 0, 0]):
+        lib.plc_tag_set_int16(tid, 2 * i, w)
+    assert lib.plc_tag_write(tid, 800) == 0
+    words, err = drv.read_block("Packet[2]", 4)
+    assert err is None, err
+    from app.engine.tagspec import words_to_text
+    assert words_to_text(words) == "A1234567"
     drv.disconnect()

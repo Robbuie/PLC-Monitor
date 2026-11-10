@@ -63,6 +63,7 @@ hidden = scapy_hidden + [
     # versions), so the import graph cannot see it.
     "snap7.type",
     "app.engine.profiles", "app.engine.tagimport", "app.engine.clock", "app.ui.tagpicker",
+    "app.engine.tagspec", "app.ui.tagedit", "sqlite3", "zipfile",
     "psutil", "matplotlib.backends.backend_qtagg",
 ]
 

@@ -81,7 +81,8 @@ class MatcherEditor(QWidget):
         self.value = QLineEdit()
         self.value.setPlaceholderText("any value")
         self.form.add("value", "Changes to", self.value,
-                      tip="Only count changes to this value, e.g. True or 1. Blank for any change.")
+                      tip="Only count changes to this value, e.g. True or 1. Blank for any "
+                          "change; !value for any change except to that value (!0UNKNOWN).")
         self.events = QComboBox()
         for text, kinds in EVENT_CHOICES:
             self.events.addItem(text, kinds)
@@ -218,6 +219,15 @@ class LatencyPage(Page):
         self.go = w.button("Measure", "primary", icon_name="latency", slot=self.measure)
         self.export_btn = w.button("Export CSV", icon_name="download", slot=self._export)
         self.export_btn.setEnabled(False)
+        self.same_value = w.Switch()
+        self.same_value.setToolTip(
+            "Pair each trigger with the first response that carries the same value -- a "
+            "VIN arriving in one tag and leaving in another tag or a socket message -- "
+            "instead of simply the next response. Several can be in flight at once.")
+        setup.body.addLayout(w.row(
+            self.same_value,
+            w.label("Match the same value (a VIN, a part number): the response must carry the "
+                    "value the trigger changed to", "hint"), None))
         setup.body.addLayout(w.row(
             w.label("Give up after", "fieldlabel"), self.give_up,
             w.label("A response later than this, or after the next trigger, does not count.",
@@ -307,10 +317,11 @@ class LatencyPage(Page):
         path = self.source.currentData()
         if not path:
             return
+        specs = self.session.group_specs()
 
         def work():
             try:
-                tags, labels = logdata.sources(logdata.read_rows(path))
+                tags, labels = logdata.sources(self.session.log_rows(path, specs))
             except OSError:
                 tags, labels = [], []
             self._choices.emit(tags, labels)
@@ -332,12 +343,22 @@ class LatencyPage(Page):
         window = self.give_up.value()
         self.go.setEnabled(False)
         self.summary.setText("Measuring...")
+        same = self.same_value.isChecked()
+        if same and trigger.kind != "plc":
+            w.info(self, "Latency", "Matching the same value needs a tag change to start the "
+                                    "clock: it is the value the tag changed to that is matched.")
+            return
         label = f"{trigger.describe()} to the next {response.describe()}"
+        if same:
+            label += " carrying the same value"
+        specs = self.session.group_specs()
+        if path == self.session.logger.log_path:
+            self.session.logger.flush(1.0)
 
         def work():
             try:
-                result = logdata.measure(logdata.read_rows(path), trigger, response,
-                                         window_ms=window, start_ms=start)
+                result = logdata.measure(self.session.log_rows(path, specs), trigger, response,
+                                         window_ms=window, start_ms=start, same_value=same)
             except OSError as exc:
                 result = exc
             self._done.emit(result, label)

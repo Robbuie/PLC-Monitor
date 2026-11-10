@@ -202,11 +202,46 @@ every poll and flashes when it changes; *Changes* counts them. Every change is
 written to the log with its old and new value. Double-click a tag to rename it.
 Each family keeps its own tag list, so switching back and forth loses nothing.
 
-**Import...** fills the list from a file instead of typing: a Studio 5000
-**L5X** export or **tag CSV** (*Tools > Export > Tags and Logic Comments*),
-with program tags as `Program:<name>.<tag>`, or any CSV or text list with the
-tag names in a column headed *Tag*, *Name*, *Address* or *Device* (or one per
-line). A list opens with nothing ticked: search it, tick the tags you want,
+**Grouped tags: text and numbers that span registers.** A PLC often keeps
+one value in several registers: a VIN as ASCII text two characters per
+register (`D1916`-`D1919` = `A1234567`), a 32-bit count in two, a BCD
+number. Logged one register at a time, those come out as meaningless
+numbers (12338, 12854 ...) on separate rows. Instead:
+
+- type `D1916 x4 ascii` in the box (or `D200 int32`, `D300 x2 bcd`,
+  `DB10,WORD20 x4 ascii`, `Data[16] x4 ascii`) and **Add**; or
+- tick several consecutive registers already in the list and press
+  **Edit...** to combine them; or
+- select a tag and press **Edit...** (or double-click its *Read as*) to give
+  it a **name** -- *Plant VIN* -- and choose how it is read: Text (ASCII),
+  INT16, UINT16, INT32, UINT32, REAL, BCD or Hex, with byte and word order
+  switches for PLCs that store them the other way round.
+
+A grouped tag's registers are read **in one request**, so they all come from
+the same PLC scan: four separate reads can catch a VIN half-written and log
+`A1NKNOWN`. The log gets one row per change, under the tag's name, with the
+decoded value (`0UNKNOWN` -> `A1234567`) and, in *notes*, which registers it
+came from. Mitsubishi (D, W, R, ZR, SD...), Siemens (a run of words in a DB)
+and Rockwell (INT array elements, both drivers) can be grouped.
+
+**Logs from before a group existed** are decoded too: Trend and Latency
+apply the open profile's grouped tags to a log that has the registers one
+per row, taking the rows of each poll together. Set up *Plant VIN* once and
+last week's log reads as VINs.
+
+**Import...** fills the list from a file instead of typing:
+
+- a **GX Works3 project** (`.gx3`): the global labels on devices, named as in
+  the project with their comments. Word arrays come in one element per row
+  (`uSendData[0]`), plus ready-made grouped tags where the element comments
+  show that consecutive registers hold one thing -- *vin digit 0/1, vin digit
+  2/3 ...* becomes **uSendData VIN**, `D1000 x4` as text;
+- a Studio 5000 **L5X** export or **tag CSV** (*Tools > Export > Tags and
+  Logic Comments*), with program tags as `Program:<name>.<tag>`;
+- any CSV or text list with the tag names in a column headed *Tag*, *Name*,
+  *Address* or *Device* (or one per line).
+
+A list opens with nothing ticked: search it, tick the tags you want,
 **Add**. UDTs and arrays are hidden unless you ask for them -- the log needs
 one value per tag.
 
@@ -290,7 +325,17 @@ pairs every occurrence in the chosen log and shows:
 - every pair, and a histogram with the 95th percentile marked.
 
 A response that arrives after the *next* trigger is credited to that trigger,
-not the earlier one. Under the results, a sentence says how long after
+not the earlier one.
+
+**Match the same value** pairs by content instead: each trigger waits for the
+first response that **carries the value it changed to** -- a VIN arriving in
+*Plant VIN* and leaving in *Sent VIN*, or in a socket message whose text holds
+it. Several vehicles can be in flight at once and each is timed on its own.
+Put `!0UNKNOWN` in *Changes to* to skip a placeholder value, and raise *Give
+up after* to longer than a vehicle takes to get there. (*Changes to* takes
+`!value` for "anything but" in every mode.)
+
+Under the results, a sentence says how long after
 happening the tag changes were seen (the poll window): each latency can be up
 to that much longer than shown. **Export CSV** saves every pair, with each
 trigger's window, for a report.
@@ -353,6 +398,7 @@ change twice; stop the service first, or just watch the Live log.
 | `old_value` / `new_value` | For tag changes |
 | `raw_hex` | Socket payload as hex |
 | `notes` | Decoded payload text, or error detail |
+| `tag_or_addr` for a named or grouped tag | Its name (*Plant VIN*); the registers and format are in `notes` |
 | `window_ms` | For a tag change: ms since the previous read of that tag. The change happened inside this window. (Added in 1.2; a log begun by an older version is archived and a new one started.) |
 
 ## Tag formats
@@ -363,6 +409,12 @@ change twice; stop the service first, or just watch the Live log.
 
 **Mitsubishi:** `D100`, `D100.5` (bit 5 of D100), `M200`, `X0`, `Y0`, `B0`,
 `TN0`/`TC0` (timer value/contact), `CN0`/`CC0` (counter value/contact)
+
+**Grouped (any family):** an address, `xN` registers, and a format --
+`D1916 x4 ascii`, `D200 int32` (two registers), `D300 x2 bcd`,
+`DB10,WORD20 x4 ascii`, `Data[16] x4 ascii`. Formats: `ascii` (or `text`),
+`int16`, `uint16`, `int32` (`dint`), `uint32`, `float32` (`real`), `bcd`,
+`hex`. **Edit...** sets the name and the byte/word order.
 
 ## Troubleshooting
 
@@ -420,6 +472,27 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.5.0 -- 2026-11-10
+
+Values that span registers, read as what they are.
+
+- **Grouped tags**: several consecutive registers read in one request and
+  decoded as text (a VIN), INT16/UINT16, INT32/UINT32, REAL, BCD or hex,
+  with byte and word order. Type `D1916 x4 ascii` in the Add box, or select
+  registers and **Edit...** to combine them. One request means one PLC
+  scan: no more half-written values.
+- **Names**: any tag can be named (*Plant VIN*); the log, Trend and Latency
+  use the name, and the notes column says which registers it came from.
+- **Import from GX Works3** (`.gx3`): global labels with their comments, and
+  grouped tags suggested from array element comments.
+- **Latency matched by value**: pair each trigger with the response that
+  carries the same value -- a VIN from arrival to send-out -- with several in
+  flight at once. *Changes to* also takes `!value` (anything but).
+- **Older logs decoded**: Trend and Latency apply the profile's grouped tags
+  to logs that recorded the registers one per row.
+- The Mitsubishi simulator in `tools/` now plays VINs through D1916 and
+  D1000.
 
 ### 1.4.2 -- 2026-11-10
 
