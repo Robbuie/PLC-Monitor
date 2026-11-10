@@ -237,7 +237,15 @@ and Rockwell (INT array elements, both drivers) can be grouped.
 **Logs from before a group existed** are decoded too: Trend and Latency
 apply the open profile's grouped tags to a log that has the registers one
 per row, taking the rows of each poll together. Set up *Plant VIN* once and
-last week's log reads as VINs.
+last week's log reads as VINs. Reading the registers separately sometimes
+caught the PLC half way through rewriting them (`T320NOWN`, or the digits
+`320`); a value replaced within a second is taken as such a torn read and
+folded into the change it was part of, and that row's *notes* say what it
+passed through. A value the old log only ever caught in part -- a send held
+for a single poll, read half before and half after it was cleared -- cannot
+be rebuilt and shows as the part that was read. Remove the single registers (D1916...D1919) from the tag
+list once the group is set up: the group reads them in one request, which is
+what keeps new logs free of torn values.
 
 **Import...** fills the list from a file instead of typing:
 
@@ -508,6 +516,13 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.6.2 -- 2026-11-10
+
+- Older logs decode without torn values: a VIN or vehicle number read half
+  old, half new (`320`, `7118`) is folded into the change it was part of,
+  with a note saying what it passed through. A first value of nothing (the
+  digits of `0UNKNOWN`) no longer makes a blank-to-blank row.
 
 ### 1.6.1 -- 2026-11-10
 

@@ -3,6 +3,15 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.6.2] - 2026-11-10
+
+- Older logs decode without torn values: when the registers of a grouped tag
+  were logged one by one, a read that caught the PLC rewriting them (`T320NOWN`,
+  digits `320`) showed as its own change. A decoded value replaced within a
+  second is now folded into the change it was part of; the row keeps the time
+  of the first sign and its notes say what it passed through.
+- A first decoded value of nothing no longer makes a blank-to-blank row.
+
 ## [1.6.1] - 2026-11-10
 
 - Fixes the release build: the 1.5.2 and 1.6.0 installers were never built,

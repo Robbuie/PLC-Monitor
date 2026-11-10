@@ -441,7 +441,83 @@ def _measure_by_value(stamped: list, window_ms: int) -> LatencyResult:
 # --------------------------------------------------------------------------
 
 
-def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]:
+def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50,
+                settle_ms: int = 1000) -> Iterator[dict]:
+    """Decode grouped tags in a log that recorded their registers one by one,
+    dropping the torn values those separate reads produced.
+
+    Registers read one at a time can straddle the moment the PLC rewrites
+    them, so one poll sees half the old VIN and half the new (`T320NOWN`,
+    the digits `320`), and the next poll the whole new one. A decoded value
+    that the next one replaces within `settle_ms` is such a tear: it is
+    folded into the change it was part of. That row keeps the time of the
+    first sign of the change -- the tear proves the PLC had started writing
+    by then -- and its note says what passed through. Only a value whose
+    every register is either the one before or the one after counts as a
+    tear; anything else, however brief, was really there.
+    """
+    decoded_keys = {spec.key for spec in specs or [] if spec.grouped}
+    if not decoded_keys or settle_ms <= 0:
+        for row in _decode_groups(rows, specs, gap_ms):
+            row.pop("_words", None)
+            yield row
+        return
+    buffer: list[dict] = []      # rows waiting while an earlier one may still be a tear
+    held: dict[str, dict] = {}   # key -> its newest decoded row, not yet settled
+    meta: dict[int, dict] = {}   # id(row) -> {"last": ms, "via": [values]}
+
+    def release(now_ms):
+        while buffer:
+            front = buffer[0]
+            info = meta.get(id(front))
+            if info is not None and (now_ms is not None and now_ms - info["last"] <= settle_ms):
+                return
+            buffer.pop(0)
+            if info is not None:
+                meta.pop(id(front), None)
+                if held.get(front["tag_or_addr"]) is front:
+                    del held[front["tag_or_addr"]]
+                if info["via"]:
+                    front["notes"] += ("; passed through " + ", ".join(
+                        repr(v) for v in info["via"]) + " (a read torn by the PLC rewriting)")
+            front.pop("_words", None)
+            yield front
+
+    for row in _decode_groups(rows, specs, gap_ms):
+        ms = row_ms(row)
+        key = row.get("tag_or_addr")
+        if key in decoded_keys and str(row.get("notes", "")).startswith("decoded from") \
+                and ms is not None:
+            earlier = held.get(key)
+            if (earlier is not None and ms - meta[id(earlier)]["last"] <= settle_ms
+                    and _torn(earlier["_words"][0], earlier["_words"][1], row["_words"][1])):
+                info = meta[id(earlier)]
+                info["via"].append(earlier["new_value"])
+                info["last"] = ms
+                earlier["new_value"] = row["new_value"]
+                earlier["_words"] = (earlier["_words"][0], row["_words"][1])
+                yield from release(ms)
+                continue
+            meta[id(row)] = {"last": ms, "via": []}
+            held[key] = row
+        buffer.append(row)
+        yield from release(ms)
+    yield from release(None)
+
+
+def _torn(before, seen, after) -> bool:
+    """Whether `seen` is a read that caught the registers part way from
+    `before` to `after`: each register one or the other, and not all of
+    either. A short-lived value that is not such a mixture -- a VIN the PLC
+    put out for 300 ms -- is real and stays."""
+    if not before or not seen or not after or not (len(before) == len(seen) == len(after)):
+        return False
+    if seen == before or seen == after:
+        return False
+    return all(s in (b, a) for b, s, a in zip(before, seen, after))
+
+
+def _decode_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]:
     """Decode grouped tags in a log that recorded their registers one by one.
 
     A log written before `D1916 x4 as Text` was set up has a row per register
@@ -468,7 +544,7 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
         members = member_names(spec.address, spec.count)
         if len(members) != spec.count:
             continue
-        state = {"spec": spec, "members": members, "words": {}, "pending": None,
+        state = {"spec": spec, "members": members, "words": {}, "pending": None, "last_words": None,
                  "last": None, "first_ms": None, "window": None, "source": ""}
         for m in members:
             owner.setdefault(m, []).append(len(groups))
@@ -484,17 +560,23 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
         g["pending"] = None
         if len(g["words"]) < len(g["members"]):
             return None
+        words = [g["words"][m] for m in g["members"]]
         try:
-            value = g["spec"].decode([g["words"][m] for m in g["members"]])
+            value = g["spec"].decode(words)
         except Exception:
             return None
         text = str(value)
+        before, g["last_words"] = g["last_words"], words
         if text == g["last"]:
             return None
         old, g["last"] = g["last"], text
         if old is None:
             # The value before this poll is known only if every register's
             # old value was: the first decoded value has no "from".
+            if text == "":
+                # ...and a first value of nothing (digits of 0UNKNOWN)
+                # would be a row from blank to blank.
+                return None
             old = ""
         spec = g["spec"]
         return {"timestamp_ms": str(ms),
@@ -502,7 +584,9 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
                 "event_type": PLC_CHANGED, "source": g["source"], "tag_or_addr": spec.key,
                 "old_value": old, "new_value": text, "raw_hex": "",
                 "notes": f"decoded from {spec.describe()}",
-                "window_ms": "" if g["window"] is None else str(g["window"])}
+                "window_ms": "" if g["window"] is None else str(g["window"]),
+                # For with_groups' torn-read check; taken off before it yields.
+                "_words": (before, words)}
 
     for row in rows:
         ms = row_ms(row)
@@ -536,7 +620,9 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
                     # Every register's starting value is known: that is
                     # the value the first change is "from".
                     try:
-                        g["last"] = str(g["spec"].decode([g["words"][m] for m in g["members"]]))
+                        start = [g["words"][m] for m in g["members"]]
+                        g["last"] = str(g["spec"].decode(start))
+                        g["last_words"] = start
                     except Exception:
                         pass
             g["words"][tag] = new

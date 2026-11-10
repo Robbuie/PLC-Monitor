@@ -386,3 +386,61 @@ def test_specs_for_reads_groups_from_the_config():
     assert [s.key for s in specs] == ["Plant VIN", "D100", "M0"]
     assert specs[0].grouped and not specs[1].grouped
     assert tags_for(plc) == ["Plant VIN", "D100", "M0"]
+
+
+def _poll(ms, before, after, which):
+    """Register rows for one poll that saw only the registers in `which`
+    rewritten -- the others were read before the PLC got to them."""
+    return [row(ms + i * 3, f"D{1916 + i}", before[i], after[i])
+            for i in which if before[i] != after[i]]
+
+
+UNKNOWN = [21808, 19278, 20302, 20055]
+
+
+def test_a_read_torn_by_the_plc_rewriting_is_folded_into_the_change():
+    # A vehicle leaves: one poll sees the first two registers already
+    # 0UNKNOWN's and the last two still the VIN's ("0UNK4567" -> 4567); the
+    # next poll, 100 ms later, sees the rest.
+    rows = _poll(1000, UNKNOWN, VIN_WORDS, range(4))
+    rows += _poll(9000, VIN_WORDS, UNKNOWN, (0, 1))
+    rows += _poll(9100, [UNKNOWN[0], UNKNOWN[1], VIN_WORDS[2], VIN_WORDS[3]], UNKNOWN, (2, 3))
+    spec = TagSpec("D1916", 4, "digits")
+    out = [r for r in logdata.with_groups(rows, [spec])]
+    assert [(r["old_value"], r["new_value"]) for r in out] == [("", "1234567"), ("1234567", "")]
+    # Stamped at the first sign of the change, and saying what it passed through.
+    assert out[1]["timestamp_ms"] == "9003"
+    assert "passed through '4567'" in out[1]["notes"]
+    # As text, the same.
+    text = TagSpec("D1916", 4, "ascii")
+    assert [r["new_value"] for r in logdata.with_groups(rows, [text])] == ["A1234567", "0UNKNOWN"]
+
+
+def test_values_that_last_are_kept_and_rows_stay_in_order():
+    rows = _poll(1000, [0] * 4, UNKNOWN, range(4))
+    rows += _poll(8000, UNKNOWN, VIN_WORDS, range(4))
+    rows.append(row(8200, "CN13", 1, 2))
+    rows += _poll(9500, VIN_WORDS, UNKNOWN, range(4))   # 1.5 s later: real
+    spec = TagSpec("D1916", 4, "ascii")
+    out = list(logdata.with_groups(rows, [spec]))
+    assert [r["new_value"] for r in out] == ["0UNKNOWN", "A1234567", "2", "0UNKNOWN"]
+    assert not any("passed through" in r["notes"] for r in out)
+
+
+def test_a_brief_value_that_is_no_mixture_stays():
+    # The PLC put a VIN out for 300 ms and cleared it: brief, but every
+    # register changed together, so it was really there.
+    rows = _poll(1000, [0] * 4, VIN_WORDS, range(4)) + _poll(1300, VIN_WORDS, [0] * 4, range(4))
+    rows += _poll(5000, [0] * 4, UNKNOWN, range(4))
+    torn = [VIN_WORDS[0], VIN_WORDS[1], UNKNOWN[2], 0]   # not half of either side
+    rows += _poll(5100, UNKNOWN, torn, range(4)) + _poll(5200, torn, VIN_WORDS, range(4))
+    spec = TagSpec("D1916", 4, "ascii")
+    out = list(logdata.with_groups(rows, [spec]))
+    assert [r["new_value"] for r in out] == ["A1234567", "", "0UNKNOWN", "A123NO", "A1234567"]
+    assert not any("_words" in r for r in out)
+
+
+def test_a_first_value_of_nothing_is_not_a_row():
+    rows = _poll(1000, [0] * 4, UNKNOWN, range(4)) + _poll(8000, UNKNOWN, VIN_WORDS, range(4))
+    out = list(logdata.with_groups(rows, [TagSpec("D1916", 4, "digits")]))
+    assert [(r["old_value"], r["new_value"]) for r in out] == [("", "1234567")]
