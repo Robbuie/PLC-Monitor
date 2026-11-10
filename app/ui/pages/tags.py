@@ -616,13 +616,17 @@ class TagsPage(Page):
         self.session.connect_plc()
 
     def _plc_state(self, state: str, detail: str) -> None:
-        running = state in ("on", "connecting")
+        running = state in ("on", "connecting", "reconnecting")
         self.connect_btn.setEnabled(not running)
-        self.disconnect_btn.setEnabled(state == "on")
+        self.disconnect_btn.setEnabled(state in ("on", "reconnecting"))
         self.driver.setEnabled(not running)
         if state == "on":
             self.state.setText(f"Polling {detail} every {self.poll.value()} ms.")
             w.set_prop(self.state, "tone", "good")
+        elif state == "reconnecting":
+            self.state.setText(f"{detail}. Polling resumes by itself when the PLC answers; "
+                               "a change made meanwhile is logged then.")
+            w.set_prop(self.state, "tone", "warn")
         elif state == "connecting":
             self.state.setText(f"Connecting to {detail}... pycomm3 reads the tag list first, "
                                "which takes a few seconds.")

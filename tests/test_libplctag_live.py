@@ -79,13 +79,15 @@ def test_reads_settle_into_working_values(server):
 def test_the_poller_logs_a_change_with_its_window(server, tmp_path):
     drv = driver()
     log = tmp_path / "log.csv"
-    poller = PLCPoller(drv, ["Go", "Count"], 50, EventLogger(str(log)))
+    logger = EventLogger(str(log))
+    poller = PLCPoller(drv, ["Go", "Count"], 50, logger)
     for _ in range(3):
         poller.poll_once("sim")
     writer = driver()
     write_dint(writer, "Go", 1)
     time.sleep(0.05)
     poller.poll_once("sim")
+    logger.flush()
     changes = [r for r in logdata.read_rows(str(log)) if r["event_type"] == "PLC_CHANGED"]
     assert [(c["tag_or_addr"], c["old_value"], c["new_value"]) for c in changes] == [("Go", "0", "1")]
     assert int(changes[0]["window_ms"]) >= 40

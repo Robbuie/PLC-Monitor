@@ -83,3 +83,45 @@ def test_no_attribute_hides_a_qt_method():
                             if attr in qt_names:
                                 clashes.append(f"{name}:{number} self.{attr}")
     assert clashes == []
+
+
+def test_reconnect_states_reach_the_chip_and_stale_ones_are_dropped(isolated_data):
+    """The poller reports "reconnecting" and "on" from its own thread. Once
+    Disconnect has been pressed, a late report from that poller must not
+    light the chip again."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    from app.core.settings import Settings
+    from app.ui.session import Session
+    from app.ui.window import MainWindow
+
+    session = Session()
+    window = MainWindow(session, Settings(os.path.join(isolated_data, "ui.json")))
+    seen = []
+    session.plcState.connect(lambda state, detail: seen.append(state))
+
+    class Current:
+        pass
+
+    current = Current()
+    session.plc_poller = current
+    session.plc_detail = "Fake at 1.2.3.4"
+    session._pollerState.emit(current, "reconnecting", "Lost Fake; reconnecting")
+    app.processEvents()
+    assert seen[-1] == "reconnecting"
+    assert "reconnecting" in window.titlebar.plc_chip.text()
+    assert window.a_plc_off.isEnabled() and not window.a_plc.isEnabled()
+    tags = window.pages["tags"]
+    assert tags.disconnect_btn.isEnabled() and not tags.connect_btn.isEnabled()
+
+    session._pollerState.emit(current, "on", "")
+    app.processEvents()
+    assert seen[-1] == "on"
+
+    session.plc_poller = None                    # Disconnect pressed
+    session._pollerState.emit(current, "on", "")
+    app.processEvents()
+    assert seen[-1] == "on" and len(seen) == 2   # the stale report was dropped
+    session.shutdown()
+    window.close()

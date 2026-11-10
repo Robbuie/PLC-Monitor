@@ -164,6 +164,13 @@ Choose the **PLC family** first; the fields follow it.
 Add tags in the box above the table, then **Connect**. Each value updates on
 every poll and flashes when it changes; *Changes* counts them. Every change is
 written to the log with its old and new value. Double-click a tag to rename it.
+
+If the PLC stops answering altogether -- power-cycled, cable pulled, switch
+rebooted -- after a few seconds the *PLC* chip turns amber (*reconnecting*)
+and PLC Monitor opens a new connection by itself, retrying every few seconds
+until a tag answers again; the log records when it was lost and when it came
+back. A tag that changed during the outage is logged with a window covering
+the whole outage. Tags that are simply wrong (a typo) do not trigger this.
 Each family keeps its own tag list, so switching back and forth loses nothing.
 
 **Adapter** matters when the PC is on more than one network: pick the one on
@@ -271,7 +278,8 @@ writes to the same log, and restarts itself a minute after a crash.
 3. **Install** (Windows asks for administrator rights), then **Start**.
 
 *What it will run* says exactly what the service will do with the saved config.
-If the PLC does not answer at boot the service keeps retrying every 15 seconds.
+If the PLC does not answer at boot the service keeps retrying every 15 seconds,
+and if it goes away later it reconnects by itself, the same as the window.
 Its own messages go to `service.log` beside the event log. **Run headless here**
 runs the same thing in a console window instead.
 
@@ -361,6 +369,22 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.3.0 -- 2026-11-09
+
+Runs unattended for weeks.
+
+- The PLC is reconnected by itself when it stops answering mid-run (power
+  cycle, cable, switch). Before, the window and the service went on logging
+  read errors until someone restarted them. The *PLC* chip shows
+  *reconnecting* meanwhile, and Disconnect still works.
+- The log is written on its own thread. In Proxy mode each message used to
+  wait for the file to be opened, written and closed before it was passed
+  on, so the monitor added its own delay to what it was measuring. A disk
+  that refuses a write (full, locked) is retried instead of losing the rows.
+- Fixed: two log rotations in the same second overwrote the first archive.
+- A PLC driver error that is raised rather than reported no longer stops
+  polling silently.
 
 ### 1.2.0 -- 2026-11-09
 

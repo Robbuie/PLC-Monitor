@@ -3,6 +3,26 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.3.0] - 2026-11-09
+
+Runs unattended for weeks.
+
+- The PLC is reconnected by itself when it stops answering mid-run (power
+  cycle, cable, switch). Before, the window and the service went on logging
+  read errors until someone restarted them. The PLC chip shows
+  "reconnecting" meanwhile, and Disconnect still works. A connection only
+  counts as back when a tag answers.
+- The log is written on its own thread. In Proxy mode each message used to
+  wait for the file to be opened, written and closed before it was passed
+  on, so the monitor added its own delay to what it was measuring. A disk
+  that refuses a write (full, locked) is retried instead of losing the rows.
+- Fixed: two log rotations in the same second overwrote the first archive.
+- A PLC driver error that is raised rather than reported no longer stops
+  polling silently.
+- libplctag: a tag whose create timed out (PLC unreachable) is retried on
+  the next poll; packed reads are only given up on a device that has never
+  answered one.
+
 ## [1.2.0] - 2026-11-09
 
 Timestamps you can trust to the millisecond.

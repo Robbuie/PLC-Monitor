@@ -14,12 +14,14 @@ Naming:
   plc_monitor_log_2024-01-15.csv.gz ← previous days, compressed
 """
 
+import atexit
 import csv
 import gzip
 import os
 import queue
 import shutil
 import threading
+import time
 from datetime import datetime, date
 
 from app.engine import clock
@@ -44,6 +46,9 @@ CSV_COLUMNS = [
     # up to this much too short. Empty for everything else.
     "window_ms",
 ]
+
+#: Tells the writer thread to finish.
+_STOP = object()
 
 DEFAULT_MAX_BYTES   = 50 * 1024 * 1024   # 50 MB
 DEFAULT_MAX_ROTATED = 30                  # keep 30 compressed files
@@ -101,6 +106,17 @@ class EventLogger:
         self._log_date  = date.today()
         self._ensure_file()
 
+        #: The last error writing the file, or "" -- for a status display.
+        self.write_error = ""
+        self._closed    = False
+        self._pending: queue.SimpleQueue = queue.SimpleQueue()
+        self._writer    = threading.Thread(target=self._write_loop, daemon=True,
+                                           name="log-writer")
+        self._writer.start()
+        # The writer is a daemon so it can never hold the process open; this
+        # makes sure what it holds still reaches the disk at a normal exit.
+        atexit.register(self.close)
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -133,10 +149,16 @@ class EventLogger:
             "window_ms":       "" if window_ms is None else int(window_ms),
         }
 
-        with self._lock:
-            self._maybe_rotate(now)
-            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
-                csv.DictWriter(f, fieldnames=CSV_COLUMNS).writerow(row)
+        # The row goes to the writer thread rather than to disk here. The
+        # callers are the poller, the sniffer and -- in Proxy mode -- the
+        # thread relaying traffic between two devices, which used to open,
+        # write and close the file before passing each message on: the
+        # monitor added its own disk time to the latency it was measuring.
+        if self._closed:
+            # Logged after close() (a last word at shutdown): straight to disk.
+            self._write_rows([row])
+        else:
+            self._pending.put(row)
 
         if self.gui_queue is not None:
             try:
@@ -146,7 +168,25 @@ class EventLogger:
 
         return row
 
+    def flush(self, timeout: float | None = 5.0) -> bool:
+        """Wait until every row logged so far is on disk. False on timeout."""
+        if not self._writer.is_alive():
+            return self._pending.empty()
+        done = threading.Event()
+        self._pending.put(done)
+        return done.wait(timeout)
+
+    def close(self, timeout: float | None = 5.0) -> None:
+        """Write what is queued and stop the writer thread. Safe to call twice."""
+        if self._closed:
+            return
+        self._closed = True
+        self._pending.put(_STOP)
+        self._writer.join(timeout)
+
     def set_log_path(self, new_path: str):
+        # Rows already logged belong to the file they were logged to.
+        self.flush()
         with self._lock:
             self.log_path = new_path
             self._log_date = date.today()
@@ -154,6 +194,7 @@ class EventLogger:
 
     def rotate_now(self) -> str | None:
         """Force an immediate rotation. Returns the .gz archive path or None."""
+        self.flush()
         with self._lock:
             return self._rotate(datetime.now())
 
@@ -178,6 +219,55 @@ class EventLogger:
     # Internal
     # ------------------------------------------------------------------
 
+    def _write_loop(self):
+        while True:
+            item = self._pending.get()
+            batch: list = [item]
+            # Everything already waiting goes in the same open/close of the
+            # file: under a burst of traffic that is one write, not hundreds.
+            while len(batch) < 2000:
+                try:
+                    batch.append(self._pending.get_nowait())
+                except queue.Empty:
+                    break
+            rows = [b for b in batch if isinstance(b, dict)]
+            while rows:
+                try:
+                    self._write_rows(rows)
+                    self.write_error = ""
+                    break
+                except Exception as exc:
+                    # Disk full, file locked by another program, folder gone.
+                    # Keep the rows and try again rather than lose them.
+                    self.write_error = str(exc)
+                    if any(b is _STOP for b in batch):
+                        break
+                    time.sleep(1.0)
+            for b in batch:
+                if isinstance(b, threading.Event):
+                    b.set()
+            if any(b is _STOP for b in batch):
+                return
+
+    def _write_rows(self, rows: list[dict]) -> None:
+        with self._lock:
+            handle = None
+            try:
+                for i, row in enumerate(rows):
+                    when = datetime.fromtimestamp(int(row["timestamp_ms"]) // 1000)
+                    if self._rotation_due(when):
+                        if handle is not None:
+                            handle.close()
+                            handle = None
+                        self._rotate(when)
+                    if handle is None:
+                        handle = open(self.log_path, "a", newline="", encoding="utf-8")
+                        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+                    writer.writerow(row)
+            finally:
+                if handle is not None:
+                    handle.close()
+
     def _ensure_file(self):
         folder = os.path.dirname(os.path.abspath(self.log_path))
         os.makedirs(folder, exist_ok=True)
@@ -190,22 +280,17 @@ class EventLogger:
             with open(self.log_path, "w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
 
-    def _maybe_rotate(self, now: datetime):
-        """Called inside the lock. Rotates if size or day threshold met."""
-        should_rotate = False
-
+    def _rotation_due(self, now: datetime) -> bool:
+        """Called inside the lock. True when size or day says rotate."""
         if self.rotate_daily and now.date() != self._log_date:
-            should_rotate = True
-
-        if not should_rotate and self.max_bytes > 0:
+            return True
+        if self.max_bytes > 0:
             try:
                 if os.path.getsize(self.log_path) >= self.max_bytes:
-                    should_rotate = True
+                    return True
             except OSError:
                 pass
-
-        if should_rotate:
-            self._rotate(now)
+        return False
 
     def _rotate(self, now: datetime) -> str | None:
         """
@@ -223,6 +308,13 @@ class EventLogger:
         stem, _  = os.path.splitext(basename)
         ts_str   = now.strftime("%Y-%m-%d_%H-%M-%S")
         archive_csv = os.path.join(folder, f"{stem}_{ts_str}.csv")
+        # Two rotations in one second (Rotate now pressed twice, a burst
+        # filling a small size limit) would otherwise share a name, and the
+        # second copy would overwrite the first before it was compressed.
+        n = 2
+        while os.path.exists(archive_csv) or os.path.exists(archive_csv + ".gz"):
+            archive_csv = os.path.join(folder, f"{stem}_{ts_str}_{n}.csv")
+            n += 1
 
         try:
             shutil.copy2(self.log_path, archive_csv)

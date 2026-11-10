@@ -28,7 +28,7 @@ from app.engine.plc_poller import PLCPoller
 
 class Session(QObject):
     status = Signal(str)
-    plcState = Signal(str, str)        # "off" | "connecting" | "on" | "error", detail
+    plcState = Signal(str, str)        # "off" | "connecting" | "on" | "reconnecting" | "error", detail
     sockState = Signal(str, str)       # "off" | "on" | "error", detail
     tagValue = Signal(str, object, str)  # tag, value, HH:MM:SS.mmm
     events = Signal(list)              # rows logged since the last pump
@@ -39,6 +39,7 @@ class Session(QObject):
     serviceState = Signal(str)
     # Private: the connect thread's answer, delivered on the UI thread.
     _connected = Signal(object, bool, str, list, int)
+    _pollerState = Signal(object, str, str)
 
     def __init__(self, config_path: str | None = None, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -65,6 +66,7 @@ class Session(QObject):
         self._pump.timeout.connect(self._drain)
         self._pump.start()
         self._connected.connect(self._on_connected)
+        self._pollerState.connect(self._poller_state)
 
     # ------------------------------------------------------------ the log
 
@@ -138,10 +140,23 @@ class Session(QObject):
             status_cb=self.status.emit,
             tag_update_cb=lambda t, v: self.tagValue.emit(
                 t, v, datetime.now().strftime("%H:%M:%S.%f")[:-3]),
+            state_cb=lambda state, detail: self._pollerState.emit(poller, state, detail),
         )
+        poller = self.plc_poller
         self.plc_poller.start()
         self.plc_detail = f"{getattr(driver, 'PLC_TYPE', 'PLC')} at {getattr(driver, 'ip', '?')}"
         self.plcState.emit("on", self.plc_detail)
+
+    def _poller_state(self, poller, state: str, detail: str) -> None:
+        """The poller lost the PLC, or got it back. It reports from its own
+        thread, so this arrives queued -- possibly after Disconnect was
+        pressed. A report from a poller that is no longer the current one is
+        stale and dropped, or a late "on" would light the chip after "off"."""
+        if poller is not self.plc_poller:
+            return
+        if state == "on":
+            detail = self.plc_detail
+        self.plcState.emit(state, detail)
 
     def disconnect_plc(self) -> None:
         poller, driver = self.plc_poller, self.plc_driver
@@ -196,6 +211,9 @@ class Session(QObject):
         monitor, self.sock_mon = self.sock_mon, None
         if monitor is not None:
             monitor.stop()
+        # The logger writes on its own thread; let it finish before the
+        # window goes, so the last rows reach the file.
+        self.logger.flush()
 
     def log_folder(self) -> str:
         return os.path.dirname(os.path.abspath(self.logger.log_path))

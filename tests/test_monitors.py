@@ -31,6 +31,7 @@ def test_server_mode_logs_what_arrives(tmp_path):
         client.sendall(b"PART;00001;OK")
         time.sleep(0.4)
     monitor.stop()
+    logger.flush()
     rows = list(logdata.read_rows(str(log)))
     assert any(r["event_type"] == "SOCK_RECV" and "PART" in r["notes"] for r in rows)
 

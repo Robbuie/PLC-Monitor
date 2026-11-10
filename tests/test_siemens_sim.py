@@ -75,3 +75,51 @@ def test_batch_read_gives_every_tag_its_own_stamp(plc):
 def test_a_bad_tag_is_an_error_not_a_crash(plc):
     value, err = plc.read_tag("DB10,FOO2")
     assert value is None and err
+
+
+def test_the_poller_reconnects_when_the_s7_server_comes_back(tmp_path, monkeypatch):
+    """Server stopped and started again on the same port: the poller notices,
+    reconnects, and logs the change that happened meanwhile."""
+    import time
+
+    from snap7.server import Server
+    from snap7.type import SrvArea
+
+    from app.engine import logdata
+    from app.engine import plc_poller as pm
+    from app.engine.event_log import EventLogger
+
+    monkeypatch.setattr(pm, "RECONNECT_AFTER_S", 0.3)
+    monkeypatch.setattr(pm, "RECONNECT_BACKOFF_S", (0.2,))
+    port = free_port()
+
+    def serve(value):
+        db = bytearray(4)
+        db[1] = value
+        server = Server()
+        server.register_area(SrvArea.DB, 1, db)
+        server.start(tcp_port=port)
+        return server
+
+    server = serve(5)
+    driver = SiemensDriver("127.0.0.1", rack=0, slot=1, port=port)
+    assert driver.connect()[0]
+    logger = EventLogger(str(tmp_path / "log.csv"))
+    poller = pm.PLCPoller(driver, ["DB1,INT0"], 50, logger)
+    poller.start()
+    time.sleep(0.4)
+    server.stop()
+    time.sleep(1.0)
+    server = serve(9)
+    deadline = time.time() + 15
+    while time.time() < deadline and not poller.reconnects:
+        time.sleep(0.1)
+    time.sleep(0.3)
+    poller.stop()
+    driver.disconnect()
+    server.stop()
+    logger.flush()
+    assert poller.reconnects == 1
+    changes = [(r["old_value"], r["new_value"]) for r in logdata.read_rows(str(tmp_path / "log.csv"))
+               if r["event_type"] == "PLC_CHANGED"]
+    assert changes == [("5", "9")]

@@ -16,12 +16,19 @@ from app.engine.plc_drivers import PLCDriver
 #: string, so a PLC string tag whose value happens to be that text still logs.
 _UNSET = object()
 
+#: Every tag failing for this long, after reads had worked, means the
+#: connection is gone rather than a tag being wrong: reconnect.
+RECONNECT_AFTER_S = 3.0
+#: Pauses between reconnect attempts; the last repeats until it works.
+RECONNECT_BACKOFF_S = (2.0, 5.0, 10.0, 15.0)
+
 
 class PLCPoller:
     def __init__(self, driver: PLCDriver, tags: list[str], poll_ms: int,
                  logger: EventLogger,
                  status_cb: Callable[[str], None] | None = None,
-                 tag_update_cb: Callable[[str, object], None] | None = None):
+                 tag_update_cb: Callable[[str, object], None] | None = None,
+                 state_cb: Callable[[str, str], None] | None = None):
         """
         driver        – connected PLCDriver instance
         tags          – list of tag name strings to monitor
@@ -29,6 +36,8 @@ class PLCPoller:
         logger        – EventLogger instance
         status_cb     – called with status strings (for GUI status bar)
         tag_update_cb – called with (tag_name, current_value) on every poll
+        state_cb      – called with ("reconnecting" | "on", detail) while it
+                        reconnects after losing the PLC, and when it is back
         """
         self.driver       = driver
         self.tags         = list(tags)
@@ -36,6 +45,7 @@ class PLCPoller:
         self.logger       = logger
         self.status_cb    = status_cb or (lambda m: None)
         self.tag_update_cb = tag_update_cb or (lambda t, v: None)
+        self.state_cb     = state_cb or (lambda s, d: None)
 
         self._stop_event  = threading.Event()
         self._thread: threading.Thread | None = None
@@ -45,6 +55,12 @@ class PLCPoller:
         self._last_seen_ns: dict[str, int] = {}
         #: How long the last full poll took, in ms.
         self.last_poll_ms: float | None = None
+        # Reconnect bookkeeping: whether any read has worked on this
+        # connection, and since when every read has failed.
+        self._had_success = False
+        self._failing_since: float | None = None
+        #: How many times the connection has been re-established.
+        self.reconnects = 0
 
     def start(self):
         self._stop_event.clear()
@@ -77,7 +93,8 @@ class PLCPoller:
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
             try:
-                self.poll_once(plc_label)
+                good, bad = self.poll_once(plc_label)
+                self._watch_connection(good, bad, plc_label)
             except Exception as exc:
                 # A driver that raises instead of returning an error must not
                 # end polling silently: the thread would die, the chip would
@@ -94,8 +111,9 @@ class PLCPoller:
         self.logger.log(EV_PLC_DISC, plc_label, notes="Polling stopped")
         self.status_cb("[PLC] Polling stopped.")
 
-    def poll_once(self, plc_label: str) -> None:
-        """Read every tag once and log what changed.
+    def poll_once(self, plc_label: str) -> tuple[int, int]:
+        """Read every tag once and log what changed. Returns how many tags
+        answered and how many failed.
 
         The tags go to the driver as one batch: a driver that can put them in
         one request (pycomm3, libplctag) answers in one network round trip
@@ -104,7 +122,8 @@ class PLCPoller:
         """
         tags = list(self.tags)
         if not tags:
-            return
+            return 0, 0
+        good = bad = 0
         reader = getattr(self.driver, "read_tags", None)
         if reader is not None:
             results = reader(tags)
@@ -134,6 +153,7 @@ class PLCPoller:
                     self.logger.log(EV_PLC_ERROR, plc_label, tag_or_addr=tag,
                                     notes=f"Read error (x{count}): {err}")
                 self.tag_update_cb(tag, f"ERROR: {err}")
+                bad += 1
                 # The last good read keeps its time, so after a run of
                 # errors the window covers the whole stretch the value was
                 # unknown -- which is the honest answer.
@@ -141,6 +161,7 @@ class PLCPoller:
 
             self._error_counts[tag] = 0
             self.tag_update_cb(tag, value)
+            good += 1
 
             previous_ns = self._last_seen_ns.get(tag)
             self._last_seen_ns[tag] = seen_ns
@@ -159,3 +180,90 @@ class PLCPoller:
                                 ts_ns=seen_ns,
                                 window_ms=window)
                 self._last_values[tag] = value
+        return good, bad
+
+    # ------------------------------------------------------------ reconnect
+
+    def _watch_connection(self, good: int, bad: int, plc_label: str) -> None:
+        """Reconnect when the PLC has stopped answering altogether.
+
+        Before 1.3 a PLC that was power-cycled, or a cable pulled and put
+        back, left the poller logging a read error every tenth poll for the
+        rest of the shift: nothing ever opened a new connection. Only a
+        connection that has worked counts -- a list of wrong tag names fails
+        every read too, and reconnecting would not fix that.
+        """
+        if good:
+            self._had_success = True
+            self._failing_since = None
+            return
+        if not bad or not self._had_success:
+            return
+        now = time.monotonic()
+        if self._failing_since is None:
+            self._failing_since = now
+        elif now - self._failing_since >= RECONNECT_AFTER_S:
+            self._reconnect(plc_label)
+
+    def _probe(self) -> tuple[bool, str]:
+        tags = list(self.tags)
+        reader = getattr(self.driver, "read_tags", None)
+        try:
+            if reader is not None:
+                results = reader(tags)
+            else:
+                results = {t: self.driver.read_tag(t) for t in tags}
+        except Exception as exc:
+            return False, str(exc)
+        errors = [r[1] for r in results.values() if r[1]]
+        if len(errors) < len(results):
+            return True, ""
+        first = (errors[0] if errors else "no answer").splitlines()[0]
+        return False, f"Connected, but no tag answered: {first}"
+
+    def _reconnect(self, plc_label: str) -> None:
+        lost_at = self._failing_since or time.monotonic()
+        self.logger.log(EV_PLC_ERROR, plc_label,
+                        notes="No tag has answered for "
+                              f"{time.monotonic() - lost_at:.0f} s; reconnecting")
+        self.status_cb(f"[PLC] Lost {plc_label}; reconnecting")
+        attempt = 0
+        last_err = None
+        while not self._stop_event.is_set():
+            self.state_cb("reconnecting", f"Lost {plc_label}; reconnecting")
+            try:
+                self.driver.disconnect()
+            except Exception:
+                pass
+            try:
+                ok, err = self.driver.connect()
+            except Exception as exc:  # a driver that raises instead of returning
+                ok, err = False, str(exc)
+            if ok and not self._stop_event.is_set():
+                # A connect that succeeded proves little on its own: the
+                # libplctag driver's connect only loads the library, and a
+                # gateway can accept a session while the CPU behind it is
+                # still booting. A read that answers is the proof.
+                ok, err = self._probe()
+            if ok and self._stop_event.is_set():
+                # Stopped while connecting. The owner may already have called
+                # disconnect and moved on; close what was just opened.
+                try:
+                    self.driver.disconnect()
+                except Exception:
+                    pass
+                return
+            if ok:
+                self.reconnects += 1
+                self._failing_since = None
+                self.logger.log(EV_PLC_CONNECTED, plc_label,
+                                notes=f"Reconnected after {time.monotonic() - lost_at:.0f} s")
+                self.status_cb(f"[PLC] Reconnected to {plc_label}")
+                self.state_cb("on", plc_label)
+                return
+            if err != last_err:
+                self.logger.log(EV_PLC_ERROR, plc_label, notes=f"Reconnect failed: {err}")
+                last_err = err
+            pause = RECONNECT_BACKOFF_S[min(attempt, len(RECONNECT_BACKOFF_S) - 1)]
+            attempt += 1
+            self._stop_event.wait(pause)

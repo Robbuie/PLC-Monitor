@@ -78,6 +78,7 @@ _RELEASES_API = "https://api.github.com/repos/libplctag/libplctag/releases/lates
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PLCTAG_STATUS_OK = 0
 PLCTAG_STATUS_PENDING = 1
+PLCTAG_ERR_TIMEOUT = -32
 #: Seconds before a tag that could not be created is tried again.
 CREATE_RETRY_S = 10.0
 _lib: ctypes.CDLL | None = None
@@ -315,13 +316,19 @@ class LibPlcTagDriver(PLCDriver):
         self._lib = None
         self._tag_ids: dict[str, int] = {}
         self._connected = False
-        # Cleared when the device turns out not to accept packed reads.
+        # Cleared when the device turns out not to accept packed reads; set
+        # proven once a packed read has worked, after which it never is.
         self._batch_ok = True
+        self._batch_proven = False
         # tag -> monotonic time before which a failed create is not retried.
         self._create_backoff: dict[str, float] = {}
         self._create_errors: dict[str, str] = {}
 
     def connect(self):
+        # A fresh start for tags that could not be created: after an outage
+        # every create failed, and they should be tried again straight away.
+        self._create_backoff.clear()
+        self._create_errors.clear()
         lib, err = _load_lib(self.cfg.dll_path)
         if not lib:
             return False, err
@@ -351,19 +358,25 @@ class LibPlcTagDriver(PLCDriver):
         tid = self._lib.plc_tag_create(attribs.encode("utf-8"), self.cfg.timeout_ms)
         if tid < 0:
             return -1, self._create_failed(
-                tag_name, f"plc_tag_create failed: {_decode_error(self._lib, tid)}\n\nAttributes:\n{attribs}")
+                tag_name, tid,
+                f"plc_tag_create failed: {_decode_error(self._lib, tid)}\n\nAttributes:\n{attribs}")
         status = self._lib.plc_tag_status(tid)
         if status != PLCTAG_STATUS_OK:
             self._lib.plc_tag_destroy(tid)
             return -1, self._create_failed(
-                tag_name, f"Tag init error: {_decode_error(self._lib, status)}\n\nAttributes:\n{attribs}")
+                tag_name, status,
+                f"Tag init error: {_decode_error(self._lib, status)}\n\nAttributes:\n{attribs}")
         self._create_backoff.pop(tag_name, None)
         self._tag_ids[tag_name] = tid
         return tid, None
 
-    def _create_failed(self, tag_name: str, message: str) -> str:
-        self._create_backoff[tag_name] = time.monotonic() + CREATE_RETRY_S
-        self._create_errors[tag_name] = message
+    def _create_failed(self, tag_name: str, code: int, message: str) -> str:
+        # A timeout says the PLC is not answering, not that the tag is wrong:
+        # it is tried again next poll, so the tag is back the moment the PLC
+        # is. Anything else (not found, bad type) waits out the back-off.
+        if code != PLCTAG_ERR_TIMEOUT:
+            self._create_backoff[tag_name] = time.monotonic() + CREATE_RETRY_S
+            self._create_errors[tag_name] = message
         return message
 
     def read_tag(self, tag):
@@ -426,17 +439,23 @@ class LibPlcTagDriver(PLCDriver):
                 for tag, tid in pending.items():
                     self._forget(tid, tag)
                     out[tag] = (None, f"Read timed out after {self.cfg.timeout_ms} ms")
-                if timed_out > 1 and not any(v[1] is None for v in out.values()):
+                if (timed_out > 1 and not self._batch_proven
+                        and not any(v[1] is None for v in out.values())):
                     # Every read of the batch hung. That is the signature of
                     # a device that refuses packed requests (some non-Logix
                     # EtherNet/IP targets; libplctag's own test server too):
                     # the packed request fails and the reads never return.
                     # Read one at a time from now on -- slower, but it works.
+                    # Only before a batch has ever worked here, though: on a
+                    # device that has answered packed reads, the same picture
+                    # is just the network going away.
                     self._batch_ok = False
                 break
             # A millisecond between checks: the stamp is taken when a read is
             # seen to be done, so this is the resolution of the stamp.
             time.sleep(0.001)
+        if len(handles) > 1 and any(v[1] is None for v in out.values()):
+            self._batch_proven = True
         return out
 
     def _finish(self, tag: str, tid: int, rc: int) -> tuple:

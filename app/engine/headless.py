@@ -128,5 +128,6 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
     if sock_mon:
         sock_mon.stop()
     logger.log(EV_INFO, "Runner", notes="Headless runner stopped")
+    logger.close()
     log.info("Done.")
     return 0

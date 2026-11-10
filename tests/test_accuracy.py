@@ -15,7 +15,19 @@ from app.engine.plc_drivers import PLCDriver, RockwellDriver
 from app.engine.plc_poller import PLCPoller
 
 
+_loggers: list = []
+
+
+def make_logger(path):
+    logger = EventLogger(path)
+    _loggers.append(logger)
+    return logger
+
+
 def rows_of(path):
+    # The logger writes on its own thread; wait for it before reading.
+    for logger in _loggers:
+        assert logger.flush()
     return list(logdata.read_rows(str(path)))
 
 
@@ -38,7 +50,7 @@ def test_precise_windows_clock_is_not_used_off_windows():
 
 def test_logger_uses_the_given_stamp_and_prints_the_right_millisecond(tmp_path):
     log = tmp_path / "log.csv"
-    logger = EventLogger(str(log))
+    logger = make_logger(str(log))
     # .123 exactly -- the value float formatting tends to print as .122
     ns = 1_700_000_000_123_000_000
     logger.log("INFO", "T", ts_ns=ns, notes="x")
@@ -50,7 +62,7 @@ def test_logger_uses_the_given_stamp_and_prints_the_right_millisecond(tmp_path):
 
 def test_logger_writes_the_window_column(tmp_path):
     log = tmp_path / "log.csv"
-    EventLogger(str(log)).log("PLC_CHANGED", "P", "Go", False, True, window_ms=98)
+    make_logger(str(log)).log("PLC_CHANGED", "P", "Go", False, True, window_ms=98)
     assert rows_of(log)[0]["window_ms"] == "98"
     with open(log, newline="", encoding="utf-8") as f:
         assert next(csv.reader(f)) == CSV_COLUMNS
@@ -61,7 +73,7 @@ def test_a_log_from_an_older_version_is_archived_not_appended_to(tmp_path):
     old_cols = CSV_COLUMNS[:-1]
     log.write_text(",".join(old_cols) + "\n1,2024-01-01 00:00:00.001,INFO,a,,,,,old\n",
                    encoding="utf-8")
-    logger = EventLogger(str(log))
+    logger = make_logger(str(log))
     logger.log("INFO", "new", notes="fresh")
     with open(log, newline="", encoding="utf-8") as f:
         assert next(csv.reader(f)) == CSV_COLUMNS
@@ -79,7 +91,7 @@ def test_a_log_from_an_older_version_is_archived_not_appended_to(tmp_path):
 
 def test_non_ascii_payload_text_is_written(tmp_path):
     log = tmp_path / "log.csv"
-    EventLogger(str(log)).log("SOCK_RECV", "S", notes="Teil gepr\u00fcft \u4e2d")
+    make_logger(str(log)).log("SOCK_RECV", "S", notes="Teil gepr\u00fcft \u4e2d")
     assert "\u4e2d" in rows_of(log)[0]["notes"]
 
 
@@ -108,7 +120,7 @@ class BatchDriver(FakeDriver):
 
 
 def poller_for(driver, tags, tmp_path):
-    logger = EventLogger(str(tmp_path / "log.csv"))
+    logger = make_logger(str(tmp_path / "log.csv"))
     return PLCPoller(driver, tags, 100, logger), tmp_path / "log.csv"
 
 
@@ -270,9 +282,11 @@ class FakeLib:
         name = attribs.decode().split("name=")[1].split("&")[0]
         self.creates.append(name)
         if name in self.bad_create:
-            return -7
+            return self.create_code
         self.names[tid] = name
         return tid
+
+    create_code = -7
 
     def plc_tag_read_blocking(self, tid):
         return -7 if self.names[tid] in self.fail else 0
@@ -377,6 +391,36 @@ def test_libplctag_a_tag_that_cannot_be_created_is_not_retried_every_poll():
     assert lib.creates.count("Typo") == 2
 
 
+def test_libplctag_reconnecting_retries_failed_creates_at_once(monkeypatch):
+    import app.engine.libplctag_driver as lpd
+    lib = FakeLib(bad_create={"Typo"})
+    monkeypatch.setattr(lpd, "_lib", lib)
+    drv = libplctag(lib)
+    drv.read_tags(["A", "Typo"])
+    assert drv.connect() == (True, "")
+    drv.read_tags(["A", "Typo"])
+    assert lib.creates.count("Typo") == 2
+
+
+def test_libplctag_a_create_timeout_is_retried_next_poll():
+    lib = FakeLib(bad_create={"A"})
+    lib.create_code = -32                     # PLCTAG_ERR_TIMEOUT: PLC not answering
+    drv = libplctag(lib)
+    drv.read_tags(["A", "B"])
+    drv.read_tags(["A", "B"])
+    assert lib.creates.count("A") == 2
+
+
+def test_libplctag_an_outage_does_not_turn_batching_off_once_it_has_worked():
+    lib = FakeLib()
+    drv = libplctag(lib, timeout_ms=30)
+    drv.read_tags(["A", "B"])                 # a packed read worked
+    lib.never = {"A", "B"}                    # then the network goes
+    out = drv.read_tags(["A", "B"])
+    assert all("timed out" in v[1] for v in out.values())
+    assert drv._batch_ok is True
+
+
 # ---------------------------------------------------------------- sniffer
 
 scapy = pytest.importorskip("scapy.all")
@@ -402,7 +446,7 @@ def pkt(src, dst, sport, dport, flags, seq, data=b"", at=0.0, udp=False):
 
 def sniffer(tmp_path):
     log = tmp_path / "log.csv"
-    return PassiveSniffer(EventLogger(str(log)), "", None, "S", our_ip="10.0.0.1"), log
+    return PassiveSniffer(make_logger(str(log)), "", None, "S", our_ip="10.0.0.1"), log
 
 
 CAM, US = "10.0.0.50", "10.0.0.1"
@@ -532,3 +576,114 @@ def test_the_latency_page_explains_the_window():
     text = window_note({"median": 100, "max": 140})
     assert "140 ms" in text and "typically within 100 ms" in text
     assert "typically" not in window_note({"median": 100, "max": 100})
+
+
+# ------------------------------------------------------------- reconnect
+
+from app.engine import plc_poller as poller_mod  # noqa: E402
+
+
+class Flaky(FakeDriver):
+    """Answers until `down` is set; connect() fails while `refuse` > 0."""
+
+    def __init__(self):
+        super().__init__()
+        self.down = False
+        self.refuse = 0
+        self.connects = 0
+        self.disconnects = 0
+
+    def read_tag(self, tag):
+        if self.down:
+            return None, "connection reset"
+        return super().read_tag(tag)
+
+    def connect(self):
+        self.connects += 1
+        if self.refuse:
+            self.refuse -= 1
+            return False, "no route to host"
+        self.down = False
+        return True, ""
+
+    def disconnect(self):
+        self.disconnects += 1
+
+
+def fast_reconnect(monkeypatch):
+    monkeypatch.setattr(poller_mod, "RECONNECT_AFTER_S", 0.2)
+    monkeypatch.setattr(poller_mod, "RECONNECT_BACKOFF_S", (0.05,))
+
+
+def test_the_poller_reconnects_after_the_plc_goes_away(tmp_path, monkeypatch):
+    fast_reconnect(monkeypatch)
+    drv = Flaky()
+    drv.values = {"Go": 0}
+    states = []
+    logger = make_logger(str(tmp_path / "log.csv"))
+    poller = PLCPoller(drv, ["Go"], 20, logger, state_cb=lambda s, d: states.append(s))
+    poller.start()
+    time.sleep(0.15)
+    drv.down, drv.refuse = True, 2
+    drv.values["Go"] = 1                         # changes while unreachable
+    deadline = time.time() + 5
+    while time.time() < deadline and not poller.reconnects:
+        time.sleep(0.02)
+    time.sleep(0.15)
+    poller.stop()
+    assert poller.reconnects == 1
+    assert drv.connects == 3                     # two refused, one accepted
+    assert states[0] == "reconnecting" and states[-1] == "on"
+    log = rows_of(tmp_path / "log.csv")
+    notes = [r["notes"] for r in log]
+    assert any("reconnecting" in n for n in notes)
+    assert sum("Reconnect failed" in n for n in notes) == 1   # same error logged once
+    assert any(n.startswith("Reconnected after") for n in notes)
+    change = [r for r in log if r["event_type"] == "PLC_CHANGED"]
+    assert [(c["old_value"], c["new_value"]) for c in change] == [("0", "1")]
+    # The change's window covers the whole outage.
+    assert int(change[0]["window_ms"]) >= 200
+
+
+def test_wrong_tag_names_do_not_cause_reconnects(tmp_path, monkeypatch):
+    fast_reconnect(monkeypatch)
+    drv = Flaky()
+    drv.errors = {"Typo": "Tag doesn't exist"}
+    poller = PLCPoller(drv, ["Typo"], 20, make_logger(str(tmp_path / "log.csv")))
+    poller.start()
+    time.sleep(0.5)
+    poller.stop()
+    assert drv.connects == 0
+
+
+def test_stop_ends_a_reconnect_loop(tmp_path, monkeypatch):
+    fast_reconnect(monkeypatch)
+    drv = Flaky()
+    drv.values = {"Go": 0}
+    poller = PLCPoller(drv, ["Go"], 20, make_logger(str(tmp_path / "log.csv")))
+    poller.start()
+    time.sleep(0.1)
+    drv.down, drv.refuse = True, 10 ** 6
+    time.sleep(0.5)
+    started = time.monotonic()
+    poller.stop()
+    assert time.monotonic() - started < 1
+    assert poller._thread is None
+
+
+def test_a_driver_that_raises_does_not_end_polling(tmp_path, monkeypatch):
+    class Raises(FakeDriver):
+        calls = 0
+
+        def read_tags(self, tags):
+            Raises.calls += 1
+            raise RuntimeError("driver bug")
+
+    monkeypatch.setattr(poller_mod.PLCPoller, "_poll_loop", poller_mod.PLCPoller._poll_loop)
+    poller = PLCPoller(Raises(), ["A"], 10, make_logger(str(tmp_path / "log.csv")))
+    poller.poll_ms = 1
+    poller.start()
+    time.sleep(1.3)
+    poller.stop()
+    assert Raises.calls >= 2
+    assert any("Poll failed: driver bug" in r["notes"] for r in rows_of(tmp_path / "log.csv"))

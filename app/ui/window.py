@@ -255,11 +255,12 @@ class MainWindow(QMainWindow):
 
     def _plc_chip(self, state: str, detail: str) -> None:
         text, tone = {"on": ("PLC  polling", "good"), "connecting": ("PLC  connecting", "info"),
+                      "reconnecting": ("PLC  reconnecting", "warn"),
                       "error": ("PLC  failed", "down")}.get(state, ("PLC  off", "idle"))
         w.set_chip(self.titlebar.plc_chip, text, tone)
         self.titlebar.plc_chip.setToolTip(detail)
-        self.a_plc.setEnabled(state not in ("on", "connecting"))
-        self.a_plc_off.setEnabled(state == "on")
+        self.a_plc.setEnabled(state not in ("on", "connecting", "reconnecting"))
+        self.a_plc_off.setEnabled(state in ("on", "reconnecting"))
         if state == "error":
             self._say(f"PLC: {detail.splitlines()[0] if detail else 'failed'}")
 
