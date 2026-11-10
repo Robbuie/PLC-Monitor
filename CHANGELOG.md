@@ -3,6 +3,13 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.6.1] - 2026-11-10
+
+- Fixes the release build: the 1.5.2 and 1.6.0 installers were never built,
+  because a comment in the installer script began with a section name and
+  Inno Setup stopped on it ("Invalid section tag"). 1.6.1 carries everything
+  from 1.5.2 and 1.6.0. A test now checks the script for such lines.
+
 ## [1.6.0] - 2026-11-10
 
 Finding a vehicle in a log.

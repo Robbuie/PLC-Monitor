@@ -509,6 +509,12 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 
 ## Changelog
 
+### 1.6.1 -- 2026-11-10
+
+- Fixes the release build: the 1.5.2 and 1.6.0 installers were never built,
+  because a comment in the installer script began with a section name and
+  Inno Setup stopped on it. 1.6.1 carries everything from 1.5.2 and 1.6.0.
+
 ### 1.6.0 -- 2026-11-10
 
 Finding a vehicle in a log.

@@ -94,7 +94,7 @@ Filename: "{sys}\sc.exe"; Parameters: "delete PLCMonitorService"; Flags: runhidd
 { Every running copy of PLC Monitor -- the window, a headless runner, the
   Windows service -- holds one of these mutexes (app/instance.py).
 
-  [InstallDelete] removes the old _internal folder before the new files are
+  The InstallDelete section removes the old _internal folder before the new files are
   copied. If a running copy still has files open, the copy fails half way and
   leaves a program that cannot start ("Failed to start embedded python
   interpreter!" -- 1.5.1 on a PC where that happened). So nothing is touched

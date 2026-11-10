@@ -89,3 +89,22 @@ def test_the_updater_asks_the_installer_for_a_log(tmp_path, monkeypatch):
     assert updates.launch(str(staged))
     assert f"/LOG={tmp_path / 'PLCMonitor-Setup-9.9.9.log'}" in seen["args"]
     assert "/SUPPRESSMSGBOXES" in seen["args"]
+
+
+def test_no_line_in_the_installer_script_looks_like_a_stray_section_tag():
+    # Inno Setup reads any line that starts with "[" as a section header --
+    # even one inside a Pascal comment in [Code]. A comment line beginning
+    # "[InstallDelete] removes..." stopped the 1.5.2 and 1.6.0 release builds
+    # with "Invalid section tag".
+    import re
+    known = {"Setup", "Languages", "Tasks", "Files", "Dirs", "Icons", "INI",
+             "InstallDelete", "UninstallDelete", "Registry", "Run", "UninstallRun",
+             "Messages", "CustomMessages", "LangOptions", "Types", "Components",
+             "Code"}
+    with open(os.path.join(ROOT, "packaging", "installer.iss"), encoding="utf-8-sig") as f:
+        text = f.read()
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            m = re.fullmatch(r"\[(\w+)\]", stripped)
+            assert m and m.group(1) in known, f"line {number} reads as a section tag: {line!r}"
