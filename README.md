@@ -284,9 +284,23 @@ edit **BPF filter** directly for anything Wireshark's capture syntax can say.
 ### Live log
 
 Every event as it is written, with the event type as a coloured badge (green
-PLC change, cyan received, amber sent, red error). Filter by kind or search for
-a tag, address, value or payload. The table holds the last few thousand rows;
-the CSV has all of them.
+PLC change, cyan received, amber sent, red error). The table holds the last few
+thousand rows; the CSV has all of them.
+
+**Open file...** (or double-click an archive) shows a whole log file here
+instead -- yesterday's, or one from another PC -- with grouped tags decoded, so
+a VIN reads as `A1234567`, not as four register numbers. A banner says which
+file is showing; **Back to live** returns to the live log.
+
+Two ways to look for something:
+
+- **Filter** (the box beside the event kinds) hides every row that does not
+  contain the text: just the rows for one tag, or one vehicle.
+- **Find** (the box under it) keeps every row and **jumps** to each one
+  containing the text, centred, with the events either side of it in view.
+  Enter or the arrows step to the next and previous match; it says *3 of 12*
+  and the time. Type a vehicle number -- `1234567`, or part of one -- to see
+  what the PLC was doing when that vehicle went through.
 
 **Log files** shows where the CSV is and handles rotation: at a size limit
 (default 50 MB), at midnight, or now. Rotated files are compressed to
@@ -295,9 +309,18 @@ keep. **Folder** opens the log folder -- in File Manager when it is installed.
 
 ### Trend
 
-Numeric tag values over time from the live log, an archive, or any PLC Monitor
-log opened with **Open file...** (a log from another PC works). Booleans plot
-as 0 and 1. **One per tag** gives each tag its own chart on a shared time axis,
+Tag values over time from the live log, an archive, or any PLC Monitor log
+opened with **Open file...** (a log from another PC works). Booleans plot as 0
+and 1. **Text tags** -- a VIN, a model, a status word; marked *text* in the
+list -- are drawn as a strip under the charts: one span per value, labelled
+where there is room (zoom in to label more), so you can read which vehicle
+was in the station while a count or a bit changed above it.
+
+**Find a value** (top right of the chart) marks every place a value appears,
+on the strips and on the number charts, with a thin line through all of
+them. The arrows step from one to the next and zoom to it; the Live log
+button beside them opens the same log in **Live log** at that row, with the
+events either side. **One per tag** gives each tag its own chart on a shared time axis,
 so tags with very different ranges stay readable; **Together** puts them on one
 axis. Hover a line for the exact time and value. Up to eight lines; each keeps
 its colour for the session. **Refresh every 30 s** turns it into a live display.
@@ -422,7 +445,10 @@ change twice; stop the service first, or just watch the Live log.
 
 **Grouped (any family):** an address, `xN` registers, and a format --
 `D1916 x4 ascii`, `D200 int32` (two registers), `D300 x2 bcd`,
-`DB10,WORD20 x4 ascii`, `Data[16] x4 ascii`. Formats: `ascii` (or `text`),
+`DB10,WORD20 x4 ascii`, `Data[16] x4 ascii`, `D1916 x4 digits`. Formats:
+`ascii` (or `text`), `digits` (the number written in the text: `A1234567`
+reads as 1234567, a placeholder like `0UNKNOWN` as no value -- so a vehicle
+number can be plotted and found as a number),
 `int16`, `uint16`, `int32` (`dint`), `uint32`, `float32` (`real`), `bcd`,
 `hex`. **Edit...** sets the name and the byte/word order.
 
@@ -482,6 +508,26 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.6.0 -- 2026-11-10
+
+Finding a vehicle in a log.
+
+- **Live log opens files**: any log (or an archive, double-clicked) shows in
+  the table with grouped tags decoded. **Find** jumps to each row containing
+  a value -- a VIN or part of one -- centred, with the events either side;
+  the Filter box still hides non-matching rows.
+- **Trend shows text tags** as a strip of values under the charts, on the
+  same time axis. Before, a tag grouped as text vanished from the Trend list.
+- **Find on Trend** marks every place a value appears and steps through them;
+  the Live log button opens that row in the log.
+- New format **digits**: the number in a text value (`A1234567` -> 1234567),
+  so the vehicle number can be plotted and searched as a number. The same
+  registers can be set up as both the text and the number.
+- Trend: a blank value breaks the line instead of drawing a slope to the next
+  one; whole numbers show in full on the axis.
+- Fixed: the Trend tag list could be emptied by a read of the previous
+  source finishing after the new one.
 
 ### 1.5.2 -- 2026-11-10
 

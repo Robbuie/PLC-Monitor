@@ -9,6 +9,11 @@ a ninth line is a chart nobody can read, so the list says so instead.
 A log records changes, not samples, so each change is drawn as a step at the
 moment it happened (logdata.series keeps the old value as well as the new).
 
+A tag whose values are text -- a VIN, a recipe, a status word -- is drawn as a
+strip under the charts: one span per value, labelled where there is room,
+on the same time axis. **Find** marks every place a value appears, on lines
+and strips alike, and steps through them.
+
 Robot signals come from RobControl's own recording (engine/robdata.py), listed
 in a second card under the tags. They share the eight lines, the colours and
 the time axis with the PLC tags, so a register on a robot and a tag in the PLC
@@ -28,6 +33,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDateTimeEdit,
     QFileDialog,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QSplitter,
@@ -49,6 +55,12 @@ PRESETS = [("Last 30 seconds", 0.5), ("Last minute", 1), ("Last 5 minutes", 5),
            ("Everything in the file", None), ("Between...", -1)]
 
 MAX_LINES = 8
+#: Roles on a tag-list item: the tag's name, and "number" or "text".
+TAG_ROLE = Qt.UserRole + 1
+KIND_ROLE = Qt.UserRole + 2
+#: A span narrower than this many pixels is not labelled: the text would
+#: overlap its neighbours. Zooming in labels it.
+LABEL_MIN_PX = 46
 
 
 class TrendPage(Page):
@@ -58,7 +70,7 @@ class TrendPage(Page):
     blurb = "Tag values over time, from the live log or an archive, with RobControl's robot signals."
 
     _loaded = Signal(object, list, str)
-    _tags_found = Signal(list)
+    _tags_found = Signal(str, list)
     _robots_found = Signal(str, list, str)
 
     def __init__(self, session, parent=None) -> None:
@@ -92,7 +104,7 @@ class TrendPage(Page):
                              "different ranges stay readable.")
         self.arrange.set_tip("shared", "Every tag on one axis. Only useful when their values "
                              "are of a similar size.")
-        self.arrange.changed.connect(lambda _k: self.plot() if self._lines else None)
+        self.arrange.changed.connect(lambda _k: self.plot() if (self._lines or self._lanes) else None)
         self.plot_btn = w.button("Plot", "primary", icon_name="trend", slot=self.plot)
         self.auto = w.Switch()
         export = w.button("Export PNG", icon_name="download", slot=self._export)
@@ -146,9 +158,9 @@ class TrendPage(Page):
         split.addWidget(self.left)
 
         chart_card = w.Card("Chart")
+        # The status goes under the chart, not in the header: with Find there
+        # too, a long status pushed the header's controls off the card.
         self.chart_status = w.label("", "hint")
-        chart_card.add_action(self.chart_status)
-        chart_card.header.addSpacing(10)
         chart_card.add_action(self.arrange)
         chart_card.header.addSpacing(10)
         self.home_btn = w.tool("home", "Back to the whole range", lambda: self._nav("home"))
@@ -158,10 +170,32 @@ class TrendPage(Page):
             button.setCheckable(True)
         for button in (self.home_btn, self.pan_btn, self.zoom_btn):
             chart_card.add_action(button)
+        chart_card.header.addSpacing(10)
+        self.finder = QLineEdit()
+        self.finder.setProperty("role", "search")
+        self.finder.setPlaceholderText("Find a value")
+        self.finder.setClearButtonEnabled(True)
+        self.finder.setFixedWidth(180)
+        self.finder.setToolTip("Marks every change to a value containing this text, on the "
+                             "charts and the text strips. Enter or the arrows step through them.")
+        self.finder.textChanged.connect(lambda _t: self._find_changed())
+        self.finder.returnPressed.connect(lambda: self._step(1))
+        self.find_prev = w.tool("back", "Previous match", lambda: self._step(-1))
+        self.find_next = w.tool("forward", "Next match", lambda: self._step(1))
+        self.find_log = w.tool("log", "Show this match in the Live log, with the events "
+                                      "either side of it", self._show_in_log)
+        self.find_log.setEnabled(False)
+        for widget in (self.finder, self.find_prev, self.find_next, self.find_log):
+            chart_card.add_action(widget)
+        self._matches: list = []
+        self._match_at = -1
+        self._marks: list = []
+        self._lanes: list = []
         self.chart_holder = QWidget()
         self.chart_layout = QVBoxLayout(self.chart_holder)
         self.chart_layout.setContentsMargins(0, 0, 0, 0)
         chart_card.body.addWidget(self.chart_holder, 1)
+        chart_card.body.addWidget(self.chart_status)
         split.addWidget(chart_card)
         split.setStretchFactor(1, 1)
 
@@ -232,6 +266,9 @@ class TrendPage(Page):
         if self.figure is None:
             return
         self.figure.clear()
+        self._lanes = []
+        self._marks = []
+        self._matches = []
         self.axes = self.figure.add_subplot(111)
         self._axes = [self.axes]
         ax = self.axes
@@ -288,21 +325,26 @@ class TrendPage(Page):
 
         def work():
             try:
-                tags = logdata.numeric_tags(self.session.log_rows(path, specs),
-                                            include_bool=include_bool)
+                tags = logdata.trend_tags(self.session.log_rows(path, specs))
             except OSError:
                 tags = []
-            self._tags_found.emit(tags)
+            self._tags_found.emit(path, tags)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _fill_tags(self, tags: list[str]) -> None:
-        ticked = {self.tag_list.item(i).text() for i in range(self.tag_list.count())
-                  if self.tag_list.item(i).checkState() == Qt.Checked}
+    def _fill_tags(self, path: str, tags: list) -> None:
+        if path != self.source.currentData():
+            return  # an earlier read, of a source no longer chosen, finishing late
+        ticked = set(self._selected())
         self.tag_list.blockSignals(True)
         self.tag_list.clear()
-        for index, tag in enumerate(tags):
-            item = QListWidgetItem(tag)
+        for index, (tag, kind) in enumerate(tags):
+            item = QListWidgetItem(tag if kind == "number" else f"{tag}   text")
+            item.setData(TAG_ROLE, tag)
+            item.setData(KIND_ROLE, kind)
+            if kind == "text":
+                item.setToolTip("Text values: drawn as a strip of spans under the charts, "
+                                "one per value. Find marks a value.")
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             on = tag in ticked if ticked else index < 4
             item.setCheckState(Qt.Checked if on else Qt.Unchecked)
@@ -310,7 +352,7 @@ class TrendPage(Page):
         self.tag_list.blockSignals(False)
         self._ticked()
         if not tags:
-            self.tag_note.setText("No numeric tag changes in this file yet.")
+            self.tag_note.setText("No tag changes in this file yet.")
 
     # ------------------------------------------------------------ robots
 
@@ -438,8 +480,13 @@ class TrendPage(Page):
         self._ticked()
 
     def _selected(self) -> list[str]:
-        return [self.tag_list.item(i).text() for i in range(self.tag_list.count())
+        return [self.tag_list.item(i).data(TAG_ROLE) or self.tag_list.item(i).text()
+                for i in range(self.tag_list.count())
                 if self.tag_list.item(i).checkState() == Qt.Checked]
+
+    def _kinds(self) -> dict[str, str]:
+        return {self.tag_list.item(i).data(TAG_ROLE): self.tag_list.item(i).data(KIND_ROLE)
+                for i in range(self.tag_list.count())}
 
     def _ticked(self, *_):
         n = len(self._selected())
@@ -450,7 +497,8 @@ class TrendPage(Page):
                                   f"draws {MAX_LINES} at most; untick some to choose which.")
             w.set_prop(self.tag_note, "tone", "warn")
         else:
-            self.tag_note.setText(f"{n} of {total} ticked. Booleans plot as 0 and 1.")
+            self.tag_note.setText(f"{n} of {total} ticked. Booleans plot as 0 and 1; text "
+                                  "tags as a strip of values.")
             w.set_prop(self.tag_note, "tone", "")
         if self.robot_list.count() and self.robot_note.property("tone") != "warn":
             self.robot_note.setText(f"{robots} of {self.robot_list.count()} ticked. RobControl "
@@ -485,12 +533,24 @@ class TrendPage(Page):
         self._loading = True
         self.chart_status.setText("Loading...")
 
+        kinds = self._kinds()
+        text_tags = [t for t in tags if kinds.get(t) == "text"]
+        number_tags = [t for t in tags if t not in text_tags]
+
         def work():
             data: dict = {}
             if tags:
                 try:
-                    data.update(logdata.series(self.session.log_rows(path, specs), tags,
-                                               start, end))
+                    # One pass over the file, keeping only the ticked tags'
+                    # changes: a day's log is a few hundred thousand rows.
+                    wanted = set(tags)
+                    rows = [r for r in self.session.log_rows(path, specs)
+                            if r.get("event_type") == "PLC_CHANGED"
+                            and (r.get("tag_or_addr") or "").strip() in wanted]
+                    if number_tags:
+                        data.update(logdata.series(rows, number_tags, start, end))
+                    if text_tags:
+                        data["__text__"] = logdata.text_series(rows, text_tags, start, end)
                 except OSError as exc:
                     data["__error__"] = str(exc)
             if robots:
@@ -509,39 +569,78 @@ class TrendPage(Page):
             problems.append(f"Could not read the log: {data['__error__']}")
         if "__robot_error__" in data:
             problems.append(f"Could not read the robots: {data['__robot_error__']}")
-        if problems and not any(data.get(tag, ([], []))[0] for tag in tags):
+        texts = data.get("__text__", {})
+        present = [tag for tag in tags if data.get(tag, ([], []))[0]]
+        lanes = [tag for tag in tags if texts.get(tag)]
+        if problems and not present and not lanes:
             self._empty("\n".join(problems))
             self.chart_status.setText("")
             return
         import matplotlib.dates as mdates
         from matplotlib.ticker import MaxNLocator
         t = sheet.tokens()
-        present = [tag for tag in tags if data.get(tag, ([], []))[0]]
         self._lines = []
-        if not present:
+        self._lanes = []
+        self._marks = []
+        if not present and not lanes:
             self._empty(f"No values for these in {label}.")
             self.chart_status.setText("")
             return
         stacked = self.arrange.value() == "stacked" and len(present) > 1
+        charts = (len(present) if stacked else 1) if present else 0
+        # Number charts get three parts of the height each, text strips one.
+        ratios = [3] * charts + [1] * len(lanes)
         self.figure.clear()
-        if stacked:
-            axes = self.figure.subplots(len(present), 1, sharex=True, squeeze=False)[:, 0]
-        else:
-            axes = [self.figure.add_subplot(111)] * len(present)
-        self._axes = list(dict.fromkeys(axes))
+        grid = self.figure.add_gridspec(len(ratios), 1, height_ratios=ratios,
+                                        hspace=0.12 if (stacked or lanes) else 0.2)
+        first = None
+        chart_axes = []
+        for i in range(charts):
+            ax = self.figure.add_subplot(grid[i, 0], sharex=first)
+            first = first or ax
+            chart_axes.append(ax)
+        lane_axes = []
+        for j in range(len(lanes)):
+            ax = self.figure.add_subplot(grid[charts + j, 0], sharex=first)
+            first = first or ax
+            lane_axes.append(ax)
+        axes_for_lines = chart_axes if stacked else [chart_axes[0]] * len(present) if present else []
+        self._axes = chart_axes + lane_axes
         self.axes = self._axes[0]
         points = 0
-        for tag, ax in zip(present, axes):
+        for tag, ax in zip(present, axes_for_lines):
             times, values = data[tag]
             ax.plot(times, values, label=tag, color=self._colour_for(tag), linewidth=2,
                     solid_joinstyle="round", solid_capstyle="round")
             self._lines.append((tag, times, values, ax))
             points += len(times)
-        for ax in self._axes:
+        for ax in chart_axes:
             self._style(ax)
             ax.yaxis.set_major_locator(MaxNLocator(nbins=4 if stacked else 8))
+            # Plain numbers on the axis: a vehicle number is 3206300, not
+            # 3.2 with "1e6" in the corner.
+            try:
+                ax.ticklabel_format(axis="y", style="plain", useOffset=False)
+            except AttributeError:
+                pass
+        # The strips need an end time for the last span: the end of the range
+        # asked for, or the latest time anything here was seen.
+        latest = [times[-1] for _tag, times, _values, _ax in self._lines]
+        latest += [spans[-1][0] for spans in texts.values() if spans]
+        _start_ms, end_ms, _label = self._window()
+        right = datetime.fromtimestamp(end_ms / 1000) if end_ms else max(latest)
+        if end_ms is None and self.range.currentData() is not None:
+            right = max(right, datetime.now())
+        earliest = [times[0] for _tag, times, _values, _ax in self._lines]
+        earliest += [spans[0][0] for spans in texts.values() if spans]
+        left = min(earliest)
+        for tag, ax in zip(lanes, lane_axes):
+            self._draw_lane(ax, tag, texts[tag], left, right)
+            points += len(texts[tag])
         locator = mdates.AutoDateLocator()
         bottom = self._axes[-1]
+        for ax in self._axes[:-1]:
+            ax.tick_params(labelbottom=False)
         bottom.xaxis.set_major_locator(locator)
         bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
         if stacked:
@@ -558,32 +657,187 @@ class TrendPage(Page):
             legend.get_frame().set_edgecolor(t["line_soft"])
             for text in legend.get_texts():
                 text.set_color(t["txt_1"])
-        else:
+        elif self._lines:
             self.axes.set_title(self._lines[0][0], color=t["txt_1"], fontsize=10, loc="left")
-        self.figure.subplots_adjust(left=0.07, right=0.98, top=0.97, bottom=0.1,
-                                    hspace=0.12 if stacked else 0.2)
+        titled = bool(self._lines) and not stacked and len(self._lines) == 1
+        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.93 if titled else 0.97,
+                                    bottom=0.1)
+        bottom.callbacks.connect("xlim_changed", lambda _ax: self._label_lanes())
+        self._label_lanes()
         self._tip = None
+        self._find_changed(redraw=False)
         self.canvas.draw_idle()
-        n = len(self._lines)
-        self.chart_status.setText(f"{n} line{'s' if n != 1 else ''}, {points:,} points, {label}"
+        n = len(self._lines) + len(self._lanes)
+        self.chart_status.setText(f"{n} tag{'s' if n != 1 else ''}, {points:,} points, {label}"
                                   f"  |  updated {time.strftime('%H:%M:%S')}"
                                   + ("  |  " + problems[0] if problems else ""))
+
+    # ------------------------------------------------------- text strips
+
+    def _draw_lane(self, ax, tag: str, spans: list, left, right) -> None:
+        """A text tag as a strip: a bar per value, from when it was taken to
+        when the next one was. Values alternate between two strengths of the
+        tag's colour so neighbours with no gap stay apart; an empty value
+        (a register cleared between messages) is left blank."""
+        import matplotlib.dates as mdates
+        t = sheet.tokens()
+        colour = self._colour_for(tag)
+        segments = []
+        for i, (when, value) in enumerate(spans):
+            begin = when
+            if i == 0 and len(spans) > 1 and spans[1][0] == when:
+                begin = left            # the value before the first change
+            finish = spans[i + 1][0] if i + 1 < len(spans) else max(right, when)
+            # Two changes in the same millisecond leave a span of no width:
+            # nothing to draw, and never one stretched to the end of the day.
+            if finish > begin:
+                segments.append((begin, finish, value))
+        x0 = mdates.date2num([b for b, _f, _v in segments])
+        widths = mdates.date2num([f for _b, f, _v in segments]) - x0
+        shades = [0.0 if not v else (0.55 if k % 2 else 0.85) for k, (_b, _f, v) in
+                  enumerate(segments)]
+        bars = ax.barh([0] * len(segments), widths, left=x0, height=0.8, color=colour,
+                       edgecolor=t["bg_2"], linewidth=0.6)
+        for bar, alpha in zip(bars, shades):
+            bar.set_alpha(alpha)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_yticks([])
+        ax.set_facecolor(t["bg_2"])
+        for side, spine in ax.spines.items():
+            spine.set_visible(side == "bottom")
+            spine.set_color(t["line"])
+        ax.tick_params(colors=t["txt_2"], labelsize=8, length=3)
+        ax.text(0.005, 0.5, tag, transform=ax.transAxes, ha="left", va="center",
+                fontsize=8.5, color=t["txt_1"], zorder=5,
+                bbox=dict(boxstyle="round,pad=0.25", fc=t["bg_2"], ec="none", alpha=0.9))
+        self._lanes.append({"tag": tag, "ax": ax, "segments": segments, "labels": []})
+
+    def _label_lanes(self) -> None:
+        """Write each value in its span where the span is wide enough, at
+        the current zoom. Called again whenever the time axis moves."""
+        if self.figure is None or not self._lanes:
+            return
+        import matplotlib.dates as mdates
+        t = sheet.tokens()
+        for lane in self._lanes:
+            for text in lane["labels"]:
+                text.remove()
+            lane["labels"] = []
+            ax = lane["ax"]
+            lo, hi = ax.get_xlim()
+            px_per_day = ax.bbox.width / max(hi - lo, 1e-12)
+            drawn = 0
+            for begin, finish, value in lane["segments"]:
+                if not value:
+                    continue
+                b, f = mdates.date2num(begin), mdates.date2num(finish)
+                if f < lo or b > hi:
+                    continue
+                if (min(f, hi) - max(b, lo)) * px_per_day < LABEL_MIN_PX:
+                    continue
+                lane["labels"].append(ax.text(
+                    (max(b, lo) + min(f, hi)) / 2, 0, value, ha="center", va="center",
+                    fontsize=8, color=t["txt_0"], clip_on=True))
+                drawn += 1
+                if drawn >= 400:
+                    break
+        self.canvas.draw_idle()
+
+    # -------------------------------------------------------------- find
+
+    def _find_changed(self, redraw: bool = True) -> None:
+        """Every change to a value containing the find text, as (time, tag,
+        value), marked with a thin line across all the charts."""
+        import matplotlib.dates as mdates
+        for mark in self._marks:
+            try:
+                mark.remove()
+            except (ValueError, AttributeError):
+                pass
+        self._marks = []
+        self._matches = []
+        self._match_at = -1
+        needle = self.finder.text().strip().lower()
+        if needle and self.figure is not None:
+            for lane in self._lanes:
+                for begin, _finish, value in lane["segments"]:
+                    if value and needle in value.lower():
+                        self._matches.append((begin, lane["tag"], value))
+            for tag, times, values, _ax in self._lines:
+                previous = None
+                for when, value in zip(times, values):
+                    if value != value:          # NaN: a gap, no value
+                        continue
+                    # Whole numbers in full: a vehicle number 3206300, not
+                    # %g's 3.2063e+06.
+                    text = str(int(value)) if float(value).is_integer() else f"{value:g}"
+                    if text != previous and needle == text.lower():
+                        self._matches.append((when, tag, text))
+                    previous = text
+            self._matches.sort(key=lambda m: m[0])
+            t = sheet.tokens()
+            for when, _tag, _value in self._matches[:2000]:
+                x = mdates.date2num(when)
+                for ax in self._axes:
+                    self._marks.append(ax.axvline(x, color=t["accent"], linewidth=1,
+                                                  alpha=0.55, zorder=4))
+        if needle:
+            n = len(self._matches)
+            self.chart_status.setText(f"{n:,} match{'es' if n != 1 else ''} for '{needle}'"
+                                      if n else f"No value contains '{needle}' in this chart.")
+        self.find_prev.setEnabled(bool(self._matches))
+        self.find_next.setEnabled(bool(self._matches))
+        self.find_log.setEnabled(False)
+        if redraw and self.figure is not None:
+            self.canvas.draw_idle()
+
+    def _step(self, direction: int) -> None:
+        """To the next (or previous) match: centred, at the current zoom if
+        that already shows some detail, else zoomed to show its neighbours."""
+        if not self._matches or self.figure is None:
+            return
+        import matplotlib.dates as mdates
+        self._match_at = (self._match_at + direction) % len(self._matches)
+        when, tag, value = self._matches[self._match_at]
+        x = mdates.date2num(when)
+        ax = self._axes[-1]
+        lo, hi = ax.get_xlim()
+        width = hi - lo
+        full = [mdates.date2num(m[0]) for m in self._matches]
+        span = (max(full) - min(full)) if len(full) > 1 else width
+        if width > max(span / 10, 1 / 1440):
+            width = max(span / 10, 2 / 1440)       # at least two minutes
+        ax.set_xlim(x - width / 2, x + width / 2)
+        # Relabel the strips for the new zoom. (The xlim_changed callback
+        # does this for the toolbar's pan and zoom, but was not reliably
+        # called for a limit set from code on a shared axis.)
+        self._label_lanes()
+        self.find_log.setEnabled(True)
+        self.chart_status.setText(f"{self._match_at + 1:,} of {len(self._matches):,}: {tag} = "
+                                  f"{value} at {when:%Y-%m-%d %H:%M:%S}.{when.microsecond // 1000:03d}")
+        self.canvas.draw_idle()
 
     def _hover(self, event) -> None:
         """Nearest point under the pointer, as a small label: tag, time, value."""
         axes = getattr(self, "_axes", [])
-        if self.figure is None or not self._lines or event.inaxes not in axes:
+        if self.figure is None or not (self._lines or self._lanes) or event.inaxes not in axes:
             if getattr(self, "_tip", None) is not None and self._tip.get_visible():
                 self._tip.set_visible(False)
                 self.canvas.draw_idle()
             return
         import matplotlib.dates as mdates
+        lane = next((ln for ln in self._lanes if ln["ax"] is event.inaxes), None)
+        if lane is not None:
+            self._hover_lane(lane, event)
+            return
         best = None
         for tag, times, values, ax in self._lines:
             if ax is not event.inaxes:
                 continue
             xs = mdates.date2num(times)
             for x, y, when in zip(xs, values, times):
+                if y != y:      # NaN: a gap in the line
+                    continue
                 px, py = ax.transData.transform((x, y))
                 d = (px - event.x) ** 2 + (py - event.y) ** 2
                 if best is None or d < best[0]:
@@ -605,6 +859,46 @@ class TrendPage(Page):
                 color=t["txt_0"], bbox=dict(boxstyle="round,pad=0.4", fc=t["bg_1"], ec=t["line"]))
         else:
             self._tip.xy = (x, value)
+            self._tip.set_text(text)
+            self._tip.set_visible(True)
+        self.canvas.draw_idle()
+
+    def _show_in_log(self) -> None:
+        if not (0 <= self._match_at < len(self._matches)):
+            return
+        when, tag, value = self._matches[self._match_at]
+        self.session.showInLog.emit(self.source.currentData() or "",
+                                    int(when.timestamp() * 1000), tag, str(value))
+
+    def _hover_lane(self, lane: dict, event) -> None:
+        """Over a text strip: the value under the pointer and when it began."""
+        import matplotlib.dates as mdates
+        x = event.xdata
+        hit = None
+        for begin, finish, value in lane["segments"]:
+            if mdates.date2num(begin) <= x <= mdates.date2num(finish):
+                hit = (begin, finish, value)
+                break
+        ax = lane["ax"]
+        if hit is None or not hit[2]:
+            if self._tip is not None and self._tip.get_visible():
+                self._tip.set_visible(False)
+                self.canvas.draw_idle()
+            return
+        begin, finish, value = hit
+        t = sheet.tokens()
+        stamp = lambda d: f"{d:%H:%M:%S}.{d.microsecond // 1000:03d}"  # noqa: E731
+        text = f"{lane['tag']}\n{value}\n{stamp(begin)} to {stamp(finish)}"
+        if self._tip is not None and self._tip.axes is not ax:
+            self._tip.remove()
+            self._tip = None
+        if self._tip is None:
+            self._tip = ax.annotate(
+                text, xy=(x, 0), xytext=(12, 10), textcoords="offset points", fontsize=8,
+                color=t["txt_0"], zorder=6,
+                bbox=dict(boxstyle="round,pad=0.4", fc=t["bg_1"], ec=t["line"]))
+        else:
+            self._tip.xy = (x, 0)
             self._tip.set_text(text)
             self._tip.set_visible(True)
         self.canvas.draw_idle()
@@ -639,7 +933,7 @@ class TrendPage(Page):
     def theme_changed(self) -> None:
         super().theme_changed()
         if self.figure is not None:
-            if self._lines:
+            if self._lines or self._lanes:
                 self.plot()
             else:
                 self._empty("Pick tags on the left and press Plot.")

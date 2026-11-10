@@ -3,6 +3,26 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.6.0] - 2026-11-10
+
+Finding a vehicle in a log.
+
+- Live log opens files: any log (or an archive, double-clicked) shows in the
+  table with grouped tags decoded. Find jumps to each row containing a value
+  -- a VIN or part of one -- centred, with the events either side; the Filter
+  box still hides non-matching rows.
+- Trend shows text tags as a strip of values under the charts, on the same
+  time axis. Before, a tag grouped as text vanished from the Trend list.
+- Find on Trend marks every place a value appears and steps through them; the
+  Live log button opens that row in the log.
+- New format "digits": the number in a text value (A1234567 -> 1234567), so
+  the vehicle number can be plotted and searched as a number. The same
+  registers can be set up as both the text and the number.
+- Trend: a blank value breaks the line instead of drawing a slope to the next
+  one; whole numbers show in full on the axis.
+- Fixed: the Trend tag list could be emptied by a read of the previous source
+  finishing after the new one.
+
 ## [1.5.2] - 2026-11-10
 
 - Fixed: an update could leave PLC Monitor unable to start ("Failed to start

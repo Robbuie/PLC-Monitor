@@ -97,6 +97,63 @@ def numeric_tags(rows: Iterable[dict], include_bool: bool = True) -> list[str]:
     return sorted(found)
 
 
+def trend_tags(rows: Iterable[dict]) -> list[tuple[str, str]]:
+    """Every tag that changed in a log, with how the Trend page can show it:
+    [(tag, "number" | "text")], sorted by name.
+
+    A tag is "number" when every value it took reads as a number or True /
+    False, and "text" otherwise -- a VIN, a recipe name, a status word. Before
+    1.6 the text ones were left out of the list altogether, so a tag grouped
+    into a VIN vanished from Trend the moment it was set up.
+    """
+    kinds: dict[str, str] = {}
+    for row in rows:
+        if row.get("event_type") != PLC_CHANGED:
+            continue
+        tag = (row.get("tag_or_addr") or "").strip()
+        if not tag or kinds.get(tag) == "text":
+            continue
+        kind = kinds.get(tag, "number")
+        for key in ("old_value", "new_value"):
+            value = (row.get(key) or "").strip()
+            if value and _number(value) is None:
+                kind = "text"
+        kinds[tag] = kind
+    return sorted(kinds.items(), key=lambda item: item[0].lower())
+
+
+def text_series(rows: Iterable[dict], tags: list[str], start_ms: int | None = None,
+                end_ms: int | None = None) -> dict[str, list[tuple[datetime, str]]]:
+    """{tag: [(time, value), ...]} -- each value a tag took and when it took
+    it, in time order, for drawing text tags as a strip of spans. The value
+    before the first change in the range is kept at that change's time, so
+    the strip does not start blank when the log knows what came before."""
+    wanted = set(tags)
+    out: dict[str, list[tuple[datetime, str]]] = {t: [] for t in tags}
+    stamped = []
+    for index, row in enumerate(rows):
+        if row.get("event_type") != PLC_CHANGED:
+            continue
+        tag = (row.get("tag_or_addr") or "").strip()
+        if tag not in wanted:
+            continue
+        ms = row_ms(row)
+        if ms is None or (start_ms is not None and ms < start_ms) or \
+                (end_ms is not None and ms > end_ms):
+            continue
+        stamped.append((ms, index, tag, row))
+    stamped.sort(key=lambda item: (item[0], item[1]))
+    for ms, _index, tag, row in stamped:
+        when = datetime.fromtimestamp(ms / 1000)
+        spans = out[tag]
+        if not spans:
+            old = (row.get("old_value") or "").strip()
+            if old:
+                spans.append((when, old))
+        spans.append((when, (row.get("new_value") or "").strip()))
+    return out
+
+
 def series(rows: Iterable[dict], tags: list[str], start_ms: int | None = None,
            end_ms: int | None = None) -> dict[str, tuple[list[datetime], list[float]]]:
     """{tag: (times, values)} for the PLC changes of each tag inside the range.
@@ -120,8 +177,9 @@ def series(rows: Iterable[dict], tags: list[str], start_ms: int | None = None,
             continue
         if end_ms is not None and ms > end_ms:
             continue
-        new = _number(row.get("new_value", ""))
-        if new is None:
+        new_text = (row.get("new_value") or "").strip()
+        new = _number(new_text)
+        if new is None and new_text:
             continue
         when = datetime.fromtimestamp(ms / 1000)
         old = _number(row.get("old_value", ""))
@@ -130,7 +188,9 @@ def series(rows: Iterable[dict], tags: list[str], start_ms: int | None = None,
             times.append(when)
             values.append(old)
         times.append(when)
-        values.append(new)
+        # A blank value (the number in a VIN between vehicles) is a gap:
+        # NaN breaks the line there instead of sloping it to the next value.
+        values.append(new if new is not None else math.nan)
     return out
 
 
@@ -399,17 +459,19 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
     from app.engine.tagspec import member_names
 
     groups = []
-    owner: dict[str, int] = {}
+    # A register can belong to more than one group: the same four registers
+    # as the VIN text and as the number in it.
+    owner: dict[str, list[int]] = {}
     for spec in specs or []:
         if not spec.grouped:
             continue
         members = member_names(spec.address, spec.count)
-        if len(members) != spec.count or any(m in owner for m in members):
+        if len(members) != spec.count:
             continue
         state = {"spec": spec, "members": members, "words": {}, "pending": None,
                  "last": None, "first_ms": None, "window": None, "source": ""}
         for m in members:
-            owner[m] = len(groups)
+            owner.setdefault(m, []).append(len(groups))
         groups.append(state)
     if not groups:
         yield from rows
@@ -453,33 +515,35 @@ def with_groups(rows: Iterable[dict], specs, gap_ms: int = 50) -> Iterator[dict]
                         due.append(out)
         yield from due
         tag = (row.get("tag_or_addr") or "").strip()
-        index = owner.get(tag)
-        if index is None or row.get("event_type") != PLC_CHANGED or ms is None:
+        indexes = owner.get(tag)
+        if not indexes or row.get("event_type") != PLC_CHANGED or ms is None:
             yield row
             continue
-        g = groups[index]
         try:
             new = int(float(row.get("new_value") or ""))
         except ValueError:
             yield row
             continue
-        if tag not in g["words"]:
-            try:
-                g["words"][tag] = int(float(row.get("old_value") or ""))
-            except ValueError:
-                pass
-            if g["last"] is None and len(g["words"]) == len(g["members"]) and g["pending"] is None:
-                # Every register's starting value is known: that is the
-                # value the first change is "from".
+        for index in indexes:
+            g = groups[index]
+            if tag not in g["words"]:
                 try:
-                    g["last"] = str(g["spec"].decode([g["words"][m] for m in g["members"]]))
-                except Exception:
+                    g["words"][tag] = int(float(row.get("old_value") or ""))
+                except ValueError:
                     pass
-        g["words"][tag] = new
-        g["source"] = row.get("source", "")
-        if g["pending"] is None:
-            g["window"] = row_window(row)
-        g["pending"] = ms
+                if (g["last"] is None and len(g["words"]) == len(g["members"])
+                        and g["pending"] is None):
+                    # Every register's starting value is known: that is
+                    # the value the first change is "from".
+                    try:
+                        g["last"] = str(g["spec"].decode([g["words"][m] for m in g["members"]]))
+                    except Exception:
+                        pass
+            g["words"][tag] = new
+            g["source"] = row.get("source", "")
+            if g["pending"] is None:
+                g["window"] = row_window(row)
+            g["pending"] = ms
     for g in groups:
         out = flush(g)
         if out:

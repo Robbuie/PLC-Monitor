@@ -36,6 +36,8 @@ class Session(QObject):
     logPathChanged = Signal(str)
     profileChanged = Signal()          # another profile (or config file) is now open
     profileDetails = Signal()          # a profile renamed, or the service pointed elsewhere
+    # Log file, ms (object: epoch ms overflows a C int), tag, value: Trend -> Live log.
+    showInLog = Signal(str, object, str, str)
     fill = Signal(str, str)            # field key, value -- "Use as ..." from another page
     goto = Signal(str)                 # bring a page to the front
     configSaved = Signal()

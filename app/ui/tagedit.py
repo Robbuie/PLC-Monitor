@@ -84,7 +84,7 @@ class TagEditDialog(QDialog):
             problem = "Type the first register's address."
         elif WIDTH.get(fmt) and spec.count % WIDTH[fmt]:
             problem = f"{FORMATS[fmt]} needs an even number of registers."
-        self.swap_bytes.setEnabled(fmt == "ascii")
+        self.swap_bytes.setEnabled(fmt in ("ascii", "digits"))
         self.swap_words.setEnabled(fmt in ("int32", "uint32", "float32", "bcd"))
         self.ok.setEnabled(not problem)
         if problem:

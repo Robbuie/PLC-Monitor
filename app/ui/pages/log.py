@@ -1,5 +1,11 @@
 """Live log: every event as it is written, and the files it is written to.
 
+It also opens a log file -- an archive, or one from another PC -- in the same
+table, with grouped tags decoded, so a day's events can be filtered and
+searched. **Filter** hides what does not match; **Find** keeps every row and
+jumps from one match to the next, centred, so the events either side of a
+vehicle number are on screen with it.
+
 The table holds the last few thousand rows -- the CSV always has every one, so
 the cap only bounds memory, and it says so. Event types are badges in the
 semantic colours (a PLC change is the same green on every theme), and the
@@ -11,15 +17,17 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from collections import deque
+import threading
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QItemSelectionModel,
     QModelIndex,
     QRectF,
     QSortFilterProxyModel,
     Qt,
     QTimer,
+    Signal,
 )
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
@@ -81,7 +89,18 @@ class EventModel(QAbstractTableModel):
     def __init__(self, cap: int, parent=None) -> None:
         super().__init__(parent)
         self.cap = max(100, cap)
-        self.rows: deque[dict] = deque()
+        # A list, not a deque: the filter and Find index into the middle of
+        # it, which a deque does in linear time -- fine for the live few
+        # thousand rows, not for a day's log opened from a file.
+        self.rows: list[dict] = []
+        #: Show the date in the time column: on for a file, which can span days.
+        self.show_date = False
+
+    def load(self, rows: list[dict]) -> None:
+        """Replace everything with `rows` (a file being viewed), uncapped."""
+        self.beginResetModel()
+        self.rows = list(rows)
+        self.endResetModel()
 
     def append(self, batch: list[dict]) -> None:
         if not batch:
@@ -90,8 +109,7 @@ class EventModel(QAbstractTableModel):
         overflow = len(self.rows) + len(batch) - self.cap
         if overflow > 0:
             self.beginRemoveRows(QModelIndex(), 0, overflow - 1)
-            for _ in range(overflow):
-                self.rows.popleft()
+            del self.rows[:overflow]
             self.endRemoveRows()
         start = len(self.rows)
         self.beginInsertRows(QModelIndex(), start, start + len(batch) - 1)
@@ -122,6 +140,8 @@ class EventModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             text = str(row.get(key, ""))
             if key == "timestamp_human":
+                if self.show_date:
+                    return text[5:] if len(text) > 5 else text
                 return text[11:] if len(text) > 11 else text
             if key == "notes" and len(text) > 240:
                 return text[:237] + "..."
@@ -149,12 +169,22 @@ class EventFilter(QSortFilterProxyModel):
         self.text = ""
 
     def set_kinds(self, kinds: set[str] | None) -> None:
-        self.kinds = kinds
-        self.invalidateFilter()
+        self._refilter(lambda: setattr(self, "kinds", kinds))
 
     def set_text(self, text: str) -> None:
-        self.text = text.lower().strip()
-        self.invalidateFilter()
+        self._refilter(lambda: setattr(self, "text", text.lower().strip()))
+
+    def _refilter(self, change) -> None:
+        # Qt 6.9 replaced invalidateFilter() with a begin/end pair; use
+        # whichever this PySide6 has, so neither warns.
+        begin = getattr(self, "beginFilterChange", None)
+        if begin is not None:
+            begin()
+            change()
+            self.endFilterChange()
+        else:
+            change()
+            self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row, source_parent):  # noqa: N802
         row = self.sourceModel().rows[source_row]
@@ -212,11 +242,20 @@ class LogPage(Page):
     key = "log"
     title = "Live log"
     glyph = "log"
-    blurb = "Every event as it is written to the CSV, newest at the bottom."
+    blurb = ("Every event as it is written to the CSV, newest at the bottom -- or any log "
+             "file, opened to search.")
+
+    _file_loaded = Signal(str, object, str)
 
     def __init__(self, session, parent=None) -> None:
         super().__init__(session, parent)
         cap = int(session.cfg.logging.get("max_gui_rows", 5000) or 5000)
+        self._live_cap = cap
+        #: The file shown instead of the live log, or None.
+        self.viewing: str | None = None
+        self._pending_find: tuple | None = None
+        self._found: list[int] = []
+        self._found_at = -1
 
         split = QSplitter(Qt.Horizontal)
         split.setChildrenCollapsible(False)
@@ -231,15 +270,32 @@ class LogPage(Page):
             self.kind.addItem(text, key)
         self.search = QLineEdit()
         self.search.setProperty("role", "search")
-        self.search.setPlaceholderText("Search tag, address, value or payload")
+        self.search.setPlaceholderText("Filter: only rows containing...")
         self.search.setClearButtonEnabled(True)
+        self.search.setToolTip("Hides every row that does not contain this text.")
+        self.finder = QLineEdit()
+        self.finder.setProperty("role", "search")
+        self.finder.setPlaceholderText("Find a value, e.g. a VIN")
+        self.finder.setClearButtonEnabled(True)
+        self.finder.setToolTip("Keeps every row and jumps to each one containing this text, "
+                             "centred, with the rows either side. Enter for the next.")
+        self.finder.textChanged.connect(lambda _t: self._find_changed())
+        self.finder.returnPressed.connect(lambda: self._step(1))
+        self.find_prev = w.tool("back", "Previous match", lambda: self._step(-1))
+        self.find_next = w.tool("forward", "Next match", lambda: self._step(1))
+        self.find_count = w.label("", "hint")
         self.follow = w.Switch()
         self.follow.setChecked(True)
         follow_label = w.label("Follow", "hint")
         clear = w.button("Clear view", slot=self._clear,
                          tip="Clears this table only. The CSV keeps everything.")
+        open_btn = w.button("Open file...", slot=self._browse,
+                            tip="Show a log file here instead of the live log: an archive, or "
+                                "a log from another PC (.csv or .csv.gz).")
         events.body.addLayout(w.row(self.kind, self.search, 12, self.follow, follow_label, clear,
-                                    stretch_at=1))
+                                    open_btn, stretch_at=1))
+        events.body.addLayout(w.row(self.finder, self.find_prev, self.find_next, self.find_count,
+                                    None))
 
         self.model = EventModel(cap, self)
         self.proxy = EventFilter(self)
@@ -298,7 +354,8 @@ class LogPage(Page):
         files.body.addWidget(w.rule())
         files.body.addWidget(w.label("ARCHIVES", "cardtitle"))
         self.archives = QListWidget()
-        self.archives.itemDoubleClicked.connect(lambda item: open_path(item.data(Qt.UserRole)))
+        self.archives.itemDoubleClicked.connect(lambda item: self.view_file(item.data(Qt.UserRole)))
+        self.archives.setToolTip("Double-click to show an archive here, to filter and search.")
         files.body.addWidget(self.archives, 1)
         files.setMinimumWidth(320)
         files.setMaximumWidth(420)
@@ -307,10 +364,17 @@ class LogPage(Page):
 
         self.kind.currentIndexChanged.connect(self._filter_changed)
         self.search.textChanged.connect(self.proxy.set_text)
+        self.search.textChanged.connect(lambda _t: self._find_changed())
         self.proxy.rowsInserted.connect(self._after_insert)
         self.proxy.modelReset.connect(self._update_count)
         self.proxy.layoutChanged.connect(self._update_count)
-        session.events.connect(self.model.append)
+        session.events.connect(self._live_rows)
+        session.showInLog.connect(self.show_in_log)
+        self._file_loaded.connect(self._show_file)
+        back = w.button("Back to live", slot=self.back_to_live)
+        self.banner.side.addWidget(back)
+        self.find_prev.setEnabled(False)
+        self.find_next.setEnabled(False)
         session.logPathChanged.connect(lambda _p: self._refresh_files())
         self._timer = QTimer(self)
         self._timer.setInterval(5000)
@@ -318,6 +382,177 @@ class LogPage(Page):
         self._timer.start()
         self._load_settings()
         self._refresh_files()
+
+    # ------------------------------------------------------- viewing a file
+
+    def _live_rows(self, rows: list[dict]) -> None:
+        # While a file is shown, live rows go to the CSV as always but not
+        # into this table; Back to live reloads the recent ones from the CSV.
+        if self.viewing is None:
+            self.model.append(rows)
+
+    def _browse(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open a log", self.session.log_folder(),
+            "PLC Monitor logs (*.csv *.csv.gz *.gz);;All files (*)")
+        if path:
+            self.view_file(path)
+
+    def view_file(self, path: str, then_find: tuple | None = None) -> None:
+        """Show `path` in the table. Read on a worker thread: a day's log is
+        a few hundred thousand rows. `then_find` = (ms, tag, value) selects
+        that row once loaded."""
+        if not path:
+            return
+        self._pending_find = then_find
+        if self.viewing == path and then_find is None:
+            return
+        if self.viewing == path and then_find is not None:
+            self._apply_pending_find()
+            return
+        self.banner.set(f"Reading {os.path.basename(path)}...", "info")
+        specs = self.session.group_specs()
+        if path == self.session.logger.log_path:
+            self.session.logger.flush(1.0)
+
+        def work():
+            try:
+                rows = list(self.session.log_rows(path, specs))
+                error = ""
+            except (OSError, EOFError) as exc:
+                rows, error = [], str(exc)
+            self._file_loaded.emit(path, rows, error)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_file(self, path: str, rows, error: str) -> None:
+        if not path:
+            # Back to live: the recent rows read back from the live CSV.
+            if self.viewing is None:
+                self.model.load(rows)
+                self.follow.setChecked(True)
+                self.table.scrollToBottom()
+                self._update_count()
+                self._find_changed()
+            return
+        if error:
+            self.banner.set(f"Could not read {os.path.basename(path)}: {error}", "warn")
+            return
+        self.viewing = path
+        self.follow.setChecked(False)
+        self.model.show_date = True
+        self.model.load(rows)
+        self.cap_note.setText(f"{len(rows):,} events in {path}")
+        self.banner.set(f"Showing {os.path.basename(path)} -- {len(rows):,} events, not the "
+                        "live log. Filter and Find work on it.", "info")
+        self._update_count()
+        self._find_changed()
+        self._apply_pending_find()
+
+    def back_to_live(self) -> None:
+        """The live log again, with its most recent rows read back from the
+        CSV so the table is not empty."""
+        self.viewing = None
+        self.model.show_date = False
+        self.banner.set("")
+        path = self.session.logger.log_path
+        self.cap_note.setText(f"Showing the last {self._live_cap:,} events. The CSV file has "
+                              "all of them.")
+        specs = self.session.group_specs()
+        self.session.logger.flush(1.0)
+
+        def work():
+            try:
+                rows = list(self.session.log_rows(path, specs))[-self._live_cap:]
+            except (OSError, EOFError):
+                rows = []
+            self._file_loaded.emit("", rows, "")
+
+        self.model.load([])
+        threading.Thread(target=work, daemon=True).start()
+
+    def show_in_log(self, path: str, ms: int, tag: str, value: str) -> None:
+        """From the Trend page: this file, at this change."""
+        self.session.goto.emit("log")
+        self.view_file(path, then_find=(ms, tag, value))
+
+    def _apply_pending_find(self) -> None:
+        if not self._pending_find:
+            return
+        ms, tag, value = self._pending_find
+        self._pending_find = None
+        # The filter could hide the row; it is for narrowing, Find for this.
+        self.search.clear()
+        self.kind.setCurrentIndex(0)
+        best = None
+        for i, row in enumerate(self.model.rows):
+            if (row.get("tag_or_addr") or "").strip() != tag:
+                continue
+            try:
+                distance = abs(int(row.get("timestamp_ms") or 0) - ms)
+            except ValueError:
+                continue
+            if best is None or distance < best[0]:
+                best = (distance, i)
+        self.finder.blockSignals(True)
+        self.finder.setText(value)
+        self.finder.blockSignals(False)
+        self._find_changed()
+        if best is not None:
+            self._select(best[1])
+            if best[1] in self._found:
+                self._found_at = self._found.index(best[1])
+                self._show_count()
+
+    # ---------------------------------------------------------------- find
+
+    def _find_changed(self) -> None:
+        """Which rows (of those the filter shows) contain the find text."""
+        needle = self.finder.text().strip().lower()
+        self._found = []
+        self._found_at = -1
+        if needle:
+            rows = self.model.rows
+            for proxy_row in range(self.proxy.rowCount()):
+                source = self.proxy.mapToSource(self.proxy.index(proxy_row, 0)).row()
+                row = rows[source]
+                if any(needle in str(row.get(k, "")).lower()
+                       for k in ("tag_or_addr", "old_value", "new_value", "notes", "source")):
+                    self._found.append(source)
+        self.find_prev.setEnabled(bool(self._found))
+        self.find_next.setEnabled(bool(self._found))
+        self._show_count()
+
+    def _show_count(self) -> None:
+        if not self.finder.text().strip():
+            self.find_count.setText("")
+        elif not self._found:
+            self.find_count.setText("No match")
+        elif self._found_at < 0:
+            self.find_count.setText(f"{len(self._found):,} matches -- Enter for the first")
+        else:
+            row = self.model.rows[self._found[self._found_at]]
+            self.find_count.setText(f"{self._found_at + 1:,} of {len(self._found):,}  "
+                                    f"{row.get('timestamp_human', '')}")
+
+    def _step(self, direction: int) -> None:
+        if not self._found:
+            return
+        self.follow.setChecked(False)
+        self._found_at = (self._found_at + direction) % len(self._found)
+        self._select(self._found[self._found_at])
+        self._show_count()
+
+    def _select(self, source_row: int) -> None:
+        """Select a row and put it in the middle of the table, so the events
+        before and after it are in view."""
+        index = self.proxy.mapFromSource(self.model.index(source_row, 0))
+        if not index.isValid():
+            return
+        self.table.selectionModel().select(
+            index, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows)
+        self.table.setCurrentIndex(index)
+        self.table.scrollTo(index, QAbstractItemView.PositionAtCenter)
 
     def _load_settings(self) -> None:
         lg = self.session.cfg.logging
@@ -329,6 +564,7 @@ class LogPage(Page):
         key = self.kind.currentData()
         self.proxy.set_kinds(FILTER_SETS.get(key) if key else None)
         self._update_count()
+        self._find_changed()
 
     def _after_insert(self, *_):
         self._update_count()
@@ -408,5 +644,9 @@ class LogPage(Page):
 
     def profile_changed(self) -> None:
         # The rows on screen are the old profile's; its log has them all.
+        if self.viewing is not None:
+            self.viewing = None
+            self.model.show_date = False
+            self.banner.set("")
         self._clear()
         self._load_settings()

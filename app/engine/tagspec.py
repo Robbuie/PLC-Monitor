@@ -27,6 +27,7 @@ from dataclasses import dataclass
 FORMATS: dict[str, str] = {
     "": "As read",
     "ascii": "Text (ASCII, 2 per register)",
+    "digits": "Number in text (the digits of the ASCII)",
     "int16": "INT16 (signed)",
     "uint16": "UINT16 (unsigned)",
     "int32": "INT32 (2 registers)",
@@ -130,6 +131,8 @@ class TagSpec:
         fmt = self.fmt
         if fmt == "ascii":
             return words_to_text(words, swap_bytes=self.swap_bytes)
+        if fmt == "digits":
+            return text_to_number(words_to_text(words, swap_bytes=self.swap_bytes))
         if fmt == "hex":
             return " ".join(f"{w:04X}" for w in words)
         if fmt == "bcd":
@@ -173,6 +176,19 @@ def words_to_text(words: list[int], swap_bytes: bool = False) -> str:
         chars.extend((high, low) if swap_bytes else (low, high))
     text = "".join("" if c == 0 else (chr(c) if 32 <= c < 127 else "?") for c in chars)
     return text.rstrip()
+
+
+def text_to_number(text: str):
+    """The number written in a piece of text: "A1234567" -> 1234567, the
+    vehicle's sequence number in its VIN. The longest run of digits is
+    taken; text with no run of at least two (a placeholder like "0UNKNOWN")
+    gives "" -- no value -- rather than a 0 that would plot as a dive to
+    zero between vehicles."""
+    runs = re.findall(r"\d+", text or "")
+    if not runs:
+        return ""
+    best = max(runs, key=len)
+    return int(best) if len(best) >= 2 else ""
 
 
 # ------------------------------------------------------------- addresses
@@ -223,6 +239,7 @@ def parse_shorthand(text: str) -> TagSpec:
     address, count, fmt = m.group(1), m.group(2), (m.group(3) or "").lower()
     if fmt and fmt not in FORMATS:
         aliases = {"text": "ascii", "string": "ascii", "str": "ascii", "dint": "int32",
+                   "number": "digits", "num": "digits",
                    "real": "float32", "float": "float32", "int": "int16", "word": "uint16",
                    "dword": "uint32", "udint": "uint32"}
         if fmt not in aliases:

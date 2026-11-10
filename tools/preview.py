@@ -158,7 +158,13 @@ def main() -> int:
     trend = window.pages["trend"]
     trend.range.setCurrentIndex(trend.range.count() - 2)
     app.processEvents()
-    trend._fill_tags(logdata.numeric_tags(rows))
+    # Let the page's own read of the (empty) live log finish first, or it
+    # lands after these and empties the list.
+    settle = time.time() + 1.0
+    while time.time() < settle:
+        app.processEvents()
+        time.sleep(0.02)
+    trend._fill_tags(trend.source.currentData(), logdata.trend_tags(rows))
     from app.engine import robdata
     db = robdata.default_db_path()
     trend._fill_robots(db, robdata.signals(db), "")
