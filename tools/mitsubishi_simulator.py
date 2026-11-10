@@ -352,6 +352,13 @@ def _handle_client(conn: socket.socket, addr):
 
 
 def main():
+    # A console or a pipe on Windows is often cp1252; never let a character
+    # it cannot show stop the simulator (1.5.0's release tests died on one).
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", PORT))
@@ -379,7 +386,7 @@ def main():
     print("    X0     input    (follows Y0)")
     print()
     print("  Counter/Timer tags (these were the crash culprits):")
-    print("    CN0    counter current value (0→999, resets)")
+    print("    CN0    counter current value (0-999, resets)")
     print("    CS0    counter set value     (1000, fixed)")
     print("    CC0    counter contact       (bit, ON near rollover)")
     print("    TN0    timer current value   (0-200, 20s cycle)")

@@ -151,20 +151,31 @@ def test_a_decode_failure_is_a_read_error(tmp_path):
 
 
 @pytest.fixture(scope="module")
-def simulator():
+def simulator(tmp_path_factory):
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
-    proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "mitsubishi_simulator.py"),
-                             str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    errors = tmp_path_factory.mktemp("sim") / "stderr.txt"
+    with open(errors, "w") as err:
+        # stdout stays a pipe-like target with the platform's encoding, the
+        # way CI runs it: a character the simulator prints that cp1252 cannot
+        # encode used to kill it here on Windows only.
+        proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "tools", "mitsubishi_simulator.py"),
+                                 str(port)], stdout=subprocess.DEVNULL, stderr=err,
+                                env=dict(os.environ, PYTHONIOENCODING="cp1252"))
     deadline = time.time() + 10
     while time.time() < deadline:
+        if proc.poll() is not None:
+            pytest.fail("The simulator exited:\n" + errors.read_text(errors="replace"))
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
             break
         except OSError:
             time.sleep(0.1)
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        pytest.fail("The simulator exited:\n" + errors.read_text(errors="replace"))
     yield port
     proc.terminate()
     proc.wait(5)

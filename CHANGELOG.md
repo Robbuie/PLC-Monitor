@@ -3,6 +3,14 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.5.1] - 2026-11-10
+
+- Fixed: the Mitsubishi simulator in `tools/` crashed at start on Windows
+  when its output went to a file or pipe (a character the Windows code page
+  cannot show), which failed the 1.5.0 release tests. The test now says why
+  if the simulator ever exits early, and runs it with the Windows code page
+  on every platform so this is caught before a release.
+
 ## [1.5.0] - 2026-11-10
 
 Values that span registers, read as what they are.
