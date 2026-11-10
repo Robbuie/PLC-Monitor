@@ -43,6 +43,13 @@ def read_rows(path: str) -> Iterator[dict]:
             return
 
 
+def row_window(row: dict) -> int | None:
+    try:
+        return int(row.get("window_ms") or "")
+    except (TypeError, ValueError):
+        return None
+
+
 def row_ms(row: dict) -> int | None:
     try:
         return int(row.get("timestamp_ms") or "")
@@ -189,6 +196,10 @@ class Pair:
     response_ms: int | None
     trigger_text: str
     response_text: str = ""
+    #: For a PLC-change trigger: how long before its stamp the change could
+    #: really have happened (the poll window). The true latency is between
+    #: delta_ms and delta_ms + trigger_window_ms. None when not known.
+    trigger_window_ms: int | None = None
 
     @property
     def delta_ms(self) -> int | None:
@@ -208,6 +219,20 @@ class LatencyResult:
     @property
     def unanswered(self) -> int:
         return sum(1 for p in self.pairs if p.response_ms is None)
+
+    def windows(self) -> list[int]:
+        """The poll windows of the answered triggers that have one."""
+        return [p.trigger_window_ms for p in self.pairs
+                if p.delta_ms is not None and p.trigger_window_ms is not None]
+
+    def window_stats(self) -> dict[str, float]:
+        """How uncertain the trigger stamps were: the median and largest poll
+        window. Empty when the log does not record windows (before 1.2, or a
+        socket trigger)."""
+        values = sorted(self.windows())
+        if not values:
+            return {}
+        return {"median": statistics.median(values), "max": values[-1]}
 
     def stats(self) -> dict[str, float]:
         values = sorted(self.answered)
@@ -259,27 +284,42 @@ def measure(rows: Iterable[dict], trigger: Matcher, response: Matcher, *,
     that later trigger, not the earlier one -- otherwise two quick triggers and
     one reply read as one slow reply.
 
-    Rows are taken in file order, which is time order: the logger appends.
+    Rows are put in time order first. The logger appends, but rows can be
+    stamped with an earlier time than the one before them -- a captured
+    packet carries the time the adapter saw it, and is written a moment
+    later, possibly after a PLC change seen in between.
     """
-    result = LatencyResult()
-    open_pair: Pair | None = None
-    for row in rows:
+    # Only rows that can matter are kept: a long log holds hundreds of
+    # thousands of rows, and pairing needs only the triggers and responses.
+    stamped = []
+    for index, row in enumerate(rows):
+        is_trigger, is_response = trigger.matches(row), response.matches(row)
+        if not (is_trigger or is_response):
+            continue
         ms = row_ms(row)
         if ms is None:
             continue
         if start_ms is not None and ms < start_ms:
             continue
         if end_ms is not None and ms > end_ms:
-            break
+            continue
+        stamped.append((ms, index, is_trigger, is_response, row))
+    stamped.sort(key=lambda item: (item[0], item[1]))
+
+    result = LatencyResult()
+    open_pair: Pair | None = None
+    for ms, _index, is_trigger, is_response, row in stamped:
         if open_pair is not None and ms - open_pair.trigger_ms > window_ms:
             open_pair = None
-        if open_pair is not None and response.matches(row) and ms >= open_pair.trigger_ms:
+        if open_pair is not None and is_response and ms >= open_pair.trigger_ms:
             open_pair.response_ms = ms
             open_pair.response_text = _summary(row)
             open_pair = None
             continue
-        if trigger.matches(row):
-            pair = Pair(trigger_ms=ms, response_ms=None, trigger_text=_summary(row))
+        if is_trigger:
+            pair = Pair(trigger_ms=ms, response_ms=None, trigger_text=_summary(row),
+                        trigger_window_ms=row_window(row) if row.get("event_type") == PLC_CHANGED
+                        else None)
             result.pairs.append(pair)
             open_pair = pair
     return result

@@ -22,6 +22,8 @@ import shutil
 import threading
 from datetime import datetime, date
 
+from app.engine import clock
+
 EV_PLC_CHANGED   = "PLC_CHANGED"
 EV_PLC_ERROR     = "PLC_ERROR"
 EV_PLC_CONNECTED = "PLC_CONNECTED"
@@ -35,7 +37,12 @@ EV_INFO          = "INFO"
 
 CSV_COLUMNS = [
     "timestamp_ms", "timestamp_human", "event_type",
-    "source", "tag_or_addr", "old_value", "new_value", "raw_hex", "notes"
+    "source", "tag_or_addr", "old_value", "new_value", "raw_hex", "notes",
+    # Added in 1.2. For a PLC change: milliseconds between the read that saw
+    # the change and the previous read of that tag. The change happened
+    # somewhere inside that window, so a latency measured from this row may be
+    # up to this much too short. Empty for everything else.
+    "window_ms",
 ]
 
 DEFAULT_MAX_BYTES   = 50 * 1024 * 1024   # 50 MB
@@ -52,6 +59,18 @@ def _compress_file(src: str) -> str | None:
         return gz_path
     except Exception:
         return None
+
+
+def _header_of(path: str) -> list[str] | None:
+    """The column names on the first line of a log, or None if it has none."""
+    try:
+        with open(path, "r", newline="", encoding="utf-8", errors="replace") as f:
+            first = f.readline()
+    except OSError:
+        return None
+    if not first.strip():
+        return None
+    return next(csv.reader([first]))
 
 
 class EventLogger:
@@ -88,11 +107,18 @@ class EventLogger:
 
     def log(self, event_type: str, source: str, tag_or_addr: str = "",
             old_value=None, new_value=None,
-            raw_data: bytes = b"", notes: str = "") -> dict:
+            raw_data: bytes = b"", notes: str = "",
+            ts_ns: int | None = None, window_ms: int | None = None) -> dict:
+        """Append one row. `ts_ns` stamps the row with a time taken earlier --
+        the moment a packet was captured, say, rather than the moment this
+        got round to writing it."""
 
-        now    = datetime.now()
-        ts_ms  = int(now.timestamp() * 1000)
-        ts_hum = now.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        ns     = clock.now_ns() if ts_ns is None else int(ts_ns)
+        ts_ms  = ns // 1_000_000
+        # Built from the integer milliseconds rather than strftime("%f") of a
+        # float, which can render .123 as .122999 and so print the wrong ms.
+        now    = datetime.fromtimestamp(ts_ms // 1000)
+        ts_hum = f"{now:%Y-%m-%d %H:%M:%S}.{ts_ms % 1000:03d}"
 
         row = {
             "timestamp_ms":    ts_ms,
@@ -104,11 +130,12 @@ class EventLogger:
             "new_value":       "" if new_value is None else str(new_value),
             "raw_hex":         raw_data.hex() if raw_data else "",
             "notes":           notes,
+            "window_ms":       "" if window_ms is None else int(window_ms),
         }
 
         with self._lock:
             self._maybe_rotate(now)
-            with open(self.log_path, "a", newline="") as f:
+            with open(self.log_path, "a", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=CSV_COLUMNS).writerow(row)
 
         if self.gui_queue is not None:
@@ -154,8 +181,13 @@ class EventLogger:
     def _ensure_file(self):
         folder = os.path.dirname(os.path.abspath(self.log_path))
         os.makedirs(folder, exist_ok=True)
-        if not os.path.exists(self.log_path):
-            with open(self.log_path, "w", newline="") as f:
+        if os.path.exists(self.log_path) and _header_of(self.log_path) not in (None, CSV_COLUMNS):
+            # A log started by an older version has fewer columns. Appending
+            # rows with more would shift every value under the wrong heading,
+            # so that file is archived as it is and a fresh one begun.
+            self._rotate(datetime.now())
+        if not os.path.exists(self.log_path) or os.path.getsize(self.log_path) == 0:
+            with open(self.log_path, "w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
 
     def _maybe_rotate(self, now: datetime):
@@ -195,7 +227,7 @@ class EventLogger:
         try:
             shutil.copy2(self.log_path, archive_csv)
             # Truncate (don't delete) the current file so any open handles survive
-            with open(self.log_path, "w", newline="") as f:
+            with open(self.log_path, "w", newline="", encoding="utf-8") as f:
                 csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
         except Exception:
             return None

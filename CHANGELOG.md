@@ -3,6 +3,36 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.2.0] - 2026-11-09
+
+Timestamps you can trust to the millisecond.
+
+- Every row is stamped with the precise Windows clock. Builds on Python
+  before 3.13 (including every release so far) stamped with a clock that
+  only moved every 15.6 ms.
+- Passive sniff stamps each message with the time the adapter captured it,
+  takes the first packet's time for a message split over several, and no
+  longer logs a TCP retransmission as a second message. Data that arrived
+  with, or just before, a connection's FIN is logged before the disconnect
+  instead of being dropped.
+- Rockwell tags are read in one request per poll (pycomm3 and libplctag), so
+  a longer tag list no longer stretches every poll. A device that refuses
+  packed requests is detected and read one tag at a time.
+- Each tag change records its poll window (new log column `window_ms`). The
+  Latency page says how much longer each latency could be, and the export
+  includes it. A log begun by an older version is archived and a new one
+  started, so columns never shift.
+- Latency pairs rows by time even when they were written slightly out of
+  order (a captured packet is stamped before it is written).
+- Fixed: Siemens M, I and Q tags failed with "no attribute 'types'" on the
+  current python-snap7.
+- Fixed: a Rockwell (pycomm3) device that refused the EtherNet/IP session was
+  shown as connected, and every read then failed.
+- Fixed: libplctag logged an error code as the value when a tag returned no
+  data, and retried a tag it could not create on every poll, holding up the
+  others each time.
+- The log is written as UTF-8, so payload text in any language is kept.
+
 ## [1.1.0] - 2026-10-05
 
 - Trend: a Robots card shows the signals RobControl records (registers, I/O,

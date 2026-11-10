@@ -21,7 +21,10 @@ How it works:
 from __future__ import annotations
 import threading
 import socket
+from decimal import Decimal
 from typing import Callable
+
+from app.engine import clock
 from app.engine.event_log import EventLogger, EV_SOCK_RECV, EV_SOCK_SENT, EV_SOCK_CONN, EV_SOCK_DISC, EV_SOCK_ERROR, EV_INFO
 
 try:
@@ -134,8 +137,10 @@ class PassiveSniffer:
         self._stop_event  = threading.Event()
         self._thread: threading.Thread | None = None
 
-        # TCP stream reassembly: (src_ip, src_port, dst_ip, dst_port) -> bytes
-        self._tcp_buffers: dict[tuple, bytes] = {}
+        # TCP stream state per direction: (src_ip, src_port, dst_ip, dst_port)
+        self._flows: dict[tuple, _Flow] = {}
+        #: Segments dropped because they repeated data already logged.
+        self.retransmissions = 0
 
     def start(self):
         ok, msg = scapy_available()
@@ -154,7 +159,7 @@ class PassiveSniffer:
         if self._thread:
             self._thread.join(timeout=4)
             self._thread = None
-        self._tcp_buffers.clear()
+        self._flows.clear()
 
     # ------------------------------------------------------------------
 
@@ -203,6 +208,7 @@ class PassiveSniffer:
         if not pkt.haslayer(IP):
             return
 
+        captured_ns = _capture_ns(pkt)
         ip_layer  = pkt[IP]
         src_ip    = ip_layer.src
         dst_ip    = ip_layer.dst
@@ -218,41 +224,47 @@ class PassiveSniffer:
             tcp = pkt[TCP]
             src_port = tcp.sport
             dst_port = tcp.dport
-            flags    = tcp.flags
+            flags    = str(tcp.flags)
             flow_key = (src_ip, src_port, dst_ip, dst_port)
             addr_str = f"{src_ip}:{src_port} → {dst_ip}:{dst_port}"
+            seq      = int(tcp.seq)
 
-            # SYN (new connection)
-            if "S" in str(flags) and "A" not in str(flags):
+            # SYN (new connection): the stream starts one past its sequence
+            # number, and anything left from an earlier connection on the
+            # same ports is history.
+            if "S" in flags and "A" not in flags:
+                self._flows[flow_key] = _Flow(next_seq=(seq + 1) % _SEQ_MOD)
                 self.logger.log(EV_SOCK_CONN, self.source_label,
-                                tag_or_addr=addr_str,
+                                tag_or_addr=addr_str, ts_ns=captured_ns,
                                 notes="TCP SYN (new connection)")
+            elif "S" in flags:
+                self._flows.setdefault(flow_key, _Flow()).next_seq = (seq + 1) % _SEQ_MOD
 
-            # FIN / RST (connection end)
-            elif "F" in str(flags) or "R" in str(flags):
-                self._tcp_buffers.pop(flow_key, None)
-                self.logger.log(EV_SOCK_DISC, self.source_label,
-                                tag_or_addr=addr_str,
-                                notes="TCP FIN/RST")
-
-            # Data payload
             payload = bytes(tcp.payload)
             if payload:
-                self._tcp_buffers[flow_key] = self._tcp_buffers.get(flow_key, b"") + payload
-                buf = self._tcp_buffers[flow_key]
+                flow = self._flows.setdefault(flow_key, _Flow())
+                payload = flow.new_data(seq, payload)
+                if payload:
+                    if not flow.buf:
+                        # The message is stamped by its first segment: that
+                        # is when the device started answering.
+                        flow.first_ns = captured_ns
+                    flow.buf += payload
+                    if "P" in flags or len(flow.buf) >= 4096:
+                        self._flush(flow, direction, addr_str)
+                else:
+                    self.retransmissions += 1
 
-                # Flush buffer once it stops growing (we log per-packet here;
-                # for a real stream reassembler you'd wait for PSH flag or timeout)
-                if "P" in str(flags) or len(buf) >= 4096:
-                    decoded = _try_decode(buf)
-                    self.logger.log(
-                        direction,
-                        self.source_label,
-                        tag_or_addr=addr_str,
-                        raw_data=buf,
-                        notes=f"{len(buf)} bytes | {decoded[:140]}",
-                    )
-                    self._tcp_buffers[flow_key] = b""
+            # FIN / RST (connection end). Data that came with it, or was
+            # still waiting for a PSH, is logged first: it was sent before
+            # the connection closed.
+            if "F" in flags or "R" in flags:
+                flow = self._flows.pop(flow_key, None)
+                if flow is not None and flow.buf:
+                    self._flush(flow, direction, addr_str)
+                self.logger.log(EV_SOCK_DISC, self.source_label,
+                                tag_or_addr=addr_str, ts_ns=captured_ns,
+                                notes="TCP FIN/RST")
 
         # ── UDP ──────────────────────────────────────────────────────
         elif pkt.haslayer(UDP):
@@ -269,8 +281,83 @@ class PassiveSniffer:
                     self.source_label,
                     tag_or_addr=addr_str,
                     raw_data=payload,
+                    ts_ns=captured_ns,
                     notes=f"{len(payload)} bytes | {decoded[:140]}",
                 )
+
+    def _flush(self, flow: "_Flow", direction: str, addr_str: str) -> None:
+        buf = flow.buf
+        decoded = _try_decode(buf)
+        self.logger.log(
+            direction,
+            self.source_label,
+            tag_or_addr=addr_str,
+            raw_data=buf,
+            ts_ns=flow.first_ns,
+            notes=f"{len(buf)} bytes | {decoded[:140]}",
+        )
+        flow.buf = b""
+        flow.first_ns = None
+
+
+_SEQ_MOD = 1 << 32
+_SEQ_HALF = 1 << 31
+
+
+class _Flow:
+    """One direction of one TCP connection, as far as the log needs it.
+
+    `next_seq` is the sequence number of the first byte not yet seen. A
+    segment that starts before it repeats data already logged -- a
+    retransmission, which a capture sees as a second copy of the message --
+    and only its new bytes, if any, are kept. Without this, one lost ACK on
+    a busy line logged the same answer twice, and the second copy could be
+    paired with the next trigger as its response.
+    """
+
+    __slots__ = ("buf", "first_ns", "next_seq")
+
+    def __init__(self, next_seq: int | None = None):
+        self.buf = b""
+        self.first_ns: int | None = None
+        self.next_seq = next_seq
+
+    def new_data(self, seq: int, payload: bytes) -> bytes:
+        """The part of `payload` (starting at `seq`) not seen before."""
+        if self.next_seq is not None:
+            # Distance from what we expect, modulo 2^32: under half the space
+            # means at or after it, otherwise before it (sequence numbers
+            # wrap, so a plain comparison is wrong near the top).
+            ahead = (seq - self.next_seq) % _SEQ_MOD
+            if ahead >= _SEQ_HALF:
+                behind = _SEQ_MOD - ahead
+                if behind >= len(payload):
+                    return b""
+                payload = payload[behind:]
+                seq = self.next_seq
+            # A gap (ahead > 0) means a segment was missed -- the capture
+            # dropped it, or it arrived out of order. Its bytes are lost to
+            # this log either way; carry on from here rather than stall.
+        self.next_seq = (seq + len(payload)) % _SEQ_MOD
+        return payload
+
+
+def _capture_ns(pkt) -> int:
+    """When the capture driver saw the packet, as epoch nanoseconds.
+
+    Npcap stamps each packet as it comes off the adapter. Using that rather
+    than the time this code gets to it keeps scapy's parsing and Python's
+    scheduling out of every socket timestamp. A missing or absurd stamp (more
+    than a minute from now) falls back to now.
+    """
+    now = clock.now_ns()
+    try:
+        stamp = int(Decimal(str(pkt.time)) * 1_000_000_000)
+    except (AttributeError, TypeError, ValueError, ArithmeticError):
+        return now
+    if abs(stamp - now) > 60 * 1_000_000_000:
+        return now
+    return stamp
 
 
 def _try_decode(data: bytes) -> str:

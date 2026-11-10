@@ -18,7 +18,11 @@ import urllib.request
 import zipfile
 import io
 import threading
+import time
 from typing import Any, Callable
+
+from app.engine import clock
+from app.engine.plc_drivers import PLCDriver
 
 CPU_TYPES = [
     "lgx",            # ControlLogix / CompactLogix (most common)
@@ -73,6 +77,9 @@ PATH_HELP = (
 _RELEASES_API = "https://api.github.com/repos/libplctag/libplctag/releases/latest"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 PLCTAG_STATUS_OK = 0
+PLCTAG_STATUS_PENDING = 1
+#: Seconds before a tag that could not be created is tried again.
+CREATE_RETRY_S = 10.0
 _lib: ctypes.CDLL | None = None
 _lib_lock = threading.Lock()
 
@@ -219,6 +226,11 @@ def _load_lib(dll_path=""):
             lib.plc_tag_status.restype   = ctypes.c_int
             lib.plc_tag_decode_error.argtypes = [ctypes.c_int]
             lib.plc_tag_decode_error.restype  = ctypes.c_char_p
+            # Optional: only the batched read uses it, to cancel a read that
+            # ran past its timeout. Very old builds may lack it.
+            if hasattr(lib, "plc_tag_abort"):
+                lib.plc_tag_abort.argtypes = [ctypes.c_int32]
+                lib.plc_tag_abort.restype  = ctypes.c_int
             lib.plc_tag_get_size.argtypes = [ctypes.c_int32]
             lib.plc_tag_get_size.restype  = ctypes.c_int
             for fname, rtype in [
@@ -254,8 +266,17 @@ def _read_value(lib, tag_id, data_type, offset=0):
     info = DATA_TYPE_MAP.get(dt)
     if not info:
         return None, f"Unknown data type: {data_type}"
-    _, fn = info
+    need, fn = info
     try:
+        # The getters return an error code *as the value* when the tag holds
+        # fewer bytes than asked for (-21, PLCTAG_ERR_NO_DATA, for an empty
+        # reply), which would be logged as a real reading. Check the size
+        # first. Strings vary in length and report their own errors.
+        if fn != "get_string":
+            size = lib.plc_tag_get_size(tag_id)
+            if size < offset + need:
+                return None, (f"The PLC returned {max(size, 0)} bytes for a {dt} "
+                              f"({need} needed). Check the tag name and its data type.")
         if fn == "get_uint8":
             v = lib.plc_tag_get_uint8(tag_id, offset)
             return (bool(v) if dt == "BOOL" else v), None
@@ -281,7 +302,7 @@ def _read_value(lib, tag_id, data_type, offset=0):
         return None, str(e)
 
 
-class LibPlcTagDriver:
+class LibPlcTagDriver(PLCDriver):
     PLC_TYPE = "Rockwell (libplctag)"
 
     def __init__(self, cfg: LibPlcTagConfig, tag_types: dict[str, str] | None = None):
@@ -294,6 +315,11 @@ class LibPlcTagDriver:
         self._lib = None
         self._tag_ids: dict[str, int] = {}
         self._connected = False
+        # Cleared when the device turns out not to accept packed reads.
+        self._batch_ok = True
+        # tag -> monotonic time before which a failed create is not retried.
+        self._create_backoff: dict[str, float] = {}
+        self._create_errors: dict[str, str] = {}
 
     def connect(self):
         lib, err = _load_lib(self.cfg.dll_path)
@@ -314,16 +340,31 @@ class LibPlcTagDriver:
     def _get_or_create(self, tag_name):
         if tag_name in self._tag_ids:
             return self._tag_ids[tag_name], None
+        # A tag that could not be created (a typo, a tag deleted from the
+        # program) is not retried on every poll: creating blocks for up to
+        # the timeout, and doing that each poll stalled every other tag with
+        # it. It is tried again after CREATE_RETRY_S.
+        retry_at = self._create_backoff.get(tag_name)
+        if retry_at is not None and time.monotonic() < retry_at:
+            return -1, self._create_errors.get(tag_name, "Tag could not be created")
         attribs = self.cfg.build_attrib(tag_name, self._type_of(tag_name))
         tid = self._lib.plc_tag_create(attribs.encode("utf-8"), self.cfg.timeout_ms)
         if tid < 0:
-            return -1, f"plc_tag_create failed: {_decode_error(self._lib, tid)}\n\nAttributes:\n{attribs}"
+            return -1, self._create_failed(
+                tag_name, f"plc_tag_create failed: {_decode_error(self._lib, tid)}\n\nAttributes:\n{attribs}")
         status = self._lib.plc_tag_status(tid)
         if status != PLCTAG_STATUS_OK:
             self._lib.plc_tag_destroy(tid)
-            return -1, f"Tag init error: {_decode_error(self._lib, status)}\n\nAttributes:\n{attribs}"
+            return -1, self._create_failed(
+                tag_name, f"Tag init error: {_decode_error(self._lib, status)}\n\nAttributes:\n{attribs}")
+        self._create_backoff.pop(tag_name, None)
         self._tag_ids[tag_name] = tid
         return tid, None
+
+    def _create_failed(self, tag_name: str, message: str) -> str:
+        self._create_backoff[tag_name] = time.monotonic() + CREATE_RETRY_S
+        self._create_errors[tag_name] = message
+        return message
 
     def read_tag(self, tag):
         if not self._connected or not self._lib:
@@ -333,9 +374,88 @@ class LibPlcTagDriver:
             return None, err
         rc = self._lib.plc_tag_read(tid, self.cfg.timeout_ms)
         if rc != PLCTAG_STATUS_OK:
-            self._tag_ids.pop(tag, None)
+            self._forget(tid, tag)
             return None, f"Read error: {_decode_error(self._lib, rc)}"
         return _read_value(self._lib, tid, self._type_of(tag))
+
+    def read_tags(self, tags):
+        """Start every read at once, then collect them.
+
+        libplctag reads asynchronously when given a timeout of 0, and packs
+        reads that are outstanding to the same PLC at the same time into one
+        request. So starting them all before waiting on any turns N round
+        trips into about one -- the same thing pycomm3 does with read(*tags).
+        Each tag is stamped when its own read is seen to finish.
+        """
+        if not self._connected or not self._lib:
+            return {t: (None, "Not connected") for t in tags}
+        if not self._batch_ok or len(tags) == 1:
+            return super().read_tags(tags)
+        lib = self._lib
+        out: dict[str, tuple] = {}
+        pending: dict[str, int] = {}
+        # Every handle is made before any read starts. Creating a tag reads
+        # it once, and a create issued while other reads are outstanding gets
+        # packed in with them -- so on a device that refuses packing, the
+        # creates would fail too and the tags would never come back.
+        handles: dict[str, int] = {}
+        for tag in dict.fromkeys(tags):
+            tid, err = self._get_or_create(tag)
+            if err:
+                out[tag] = (None, err)
+            else:
+                handles[tag] = tid
+        for tag, tid in handles.items():
+            rc = lib.plc_tag_read(tid, 0)
+            if rc == PLCTAG_STATUS_PENDING:
+                pending[tag] = tid
+            else:
+                out[tag] = self._finish(tag, tid, rc)
+
+        deadline = time.monotonic() + max(1, self.cfg.timeout_ms) / 1000
+        while pending:
+            for tag, tid in list(pending.items()):
+                status = lib.plc_tag_status(tid)
+                if status != PLCTAG_STATUS_PENDING:
+                    out[tag] = self._finish(tag, tid, status)
+                    del pending[tag]
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                timed_out = len(pending)
+                for tag, tid in pending.items():
+                    self._forget(tid, tag)
+                    out[tag] = (None, f"Read timed out after {self.cfg.timeout_ms} ms")
+                if timed_out > 1 and not any(v[1] is None for v in out.values()):
+                    # Every read of the batch hung. That is the signature of
+                    # a device that refuses packed requests (some non-Logix
+                    # EtherNet/IP targets; libplctag's own test server too):
+                    # the packed request fails and the reads never return.
+                    # Read one at a time from now on -- slower, but it works.
+                    self._batch_ok = False
+                break
+            # A millisecond between checks: the stamp is taken when a read is
+            # seen to be done, so this is the resolution of the stamp.
+            time.sleep(0.001)
+        return out
+
+    def _finish(self, tag: str, tid: int, rc: int) -> tuple:
+        seen = clock.now_ns()
+        if rc != PLCTAG_STATUS_OK:
+            self._forget(tid, tag)
+            return (None, f"Read error: {_decode_error(self._lib, rc)}", seen)
+        value, err = _read_value(self._lib, tid, self._type_of(tag))
+        return (value, err, seen)
+
+    def _forget(self, tid: int, tag: str) -> None:
+        """Drop a tag handle after a failure so the next poll makes a new one."""
+        self._tag_ids.pop(tag, None)
+        try:
+            if hasattr(self._lib, "plc_tag_abort"):
+                self._lib.plc_tag_abort(tid)
+            self._lib.plc_tag_destroy(tid)
+        except Exception:
+            pass
 
     def _type_of(self, tag: str) -> str:
         return self.tag_types.get(tag, self.cfg.data_type)

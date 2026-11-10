@@ -1,0 +1,77 @@
+"""The Siemens driver against python-snap7's own S7 server: every tag form
+in the guide, read off a real S7 connection."""
+
+import socket
+
+import pytest
+
+snap7 = pytest.importorskip("snap7")
+
+from app.engine.plc_drivers import SiemensDriver  # noqa: E402
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture(scope="module")
+def plc():
+    from snap7 import util
+    from snap7.server import Server
+    try:
+        from snap7.type import SrvArea
+    except ImportError:  # python-snap7 1.x
+        from snap7.types import srvAreaDB as _db  # noqa: F401
+        pytest.skip("this test is written for python-snap7 2.x/3.x")
+    db = bytearray(32)
+    db[0] = 0b101
+    util.set_real(db, 4, 3.5)
+    util.set_dint(db, 8, -123456)
+    util.set_int(db, 12, -5)
+    db[14] = 200
+    db[16], db[17] = 1, 2
+    mk, pe, pa = bytearray(4), bytearray(4), bytearray(4)
+    mk[1] = 0b10
+    pe[0] = 0b1
+    pa[2] = 0b1000_0000
+    server = Server()
+    server.register_area(SrvArea.DB, 10, db)
+    server.register_area(SrvArea.MK, 0, mk)
+    server.register_area(SrvArea.PE, 0, pe)
+    server.register_area(SrvArea.PA, 0, pa)
+    port = free_port()
+    server.start(tcp_port=port)
+    driver = SiemensDriver("127.0.0.1", rack=0, slot=1, port=port)
+    ok, err = driver.connect()
+    assert ok, err
+    yield driver
+    driver.disconnect()
+    server.stop()
+
+
+@pytest.mark.parametrize("tag, value", [
+    ("DB10,X0.0", True), ("DB10,X0.1", False), ("DB10,X0.2", True),
+    ("DB10,REAL4", 3.5), ("DB10,DINT8", -123456), ("DB10,INT12", -5),
+    ("DB10,BYTE14", 200), ("DB10,WORD16", 258),
+    ("M1.1", True), ("M1.0", False), ("I0.0", True), ("Q2.7", True), ("Q2.6", False),
+])
+def test_every_tag_form_reads(plc, tag, value):
+    got, err = plc.read_tag(tag)
+    assert err is None
+    assert got == pytest.approx(value) if isinstance(value, float) else got == value
+
+
+def test_batch_read_gives_every_tag_its_own_stamp(plc):
+    out = plc.read_tags(["DB10,INT12", "M1.1"])
+    assert out["DB10,INT12"][:2] == (-5, None)
+    assert out["M1.1"][:2] == (True, None)
+    assert out["DB10,INT12"][2] <= out["M1.1"][2]
+
+
+def test_a_bad_tag_is_an_error_not_a_crash(plc):
+    value, err = plc.read_tag("DB10,FOO2")
+    assert value is None and err

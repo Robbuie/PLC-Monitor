@@ -36,7 +36,8 @@ def demo_log(path: str, minutes: int = 50) -> None:
                      "timestamp_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
                      + f".{int((t % 1) * 1000):03d}",
                      "event_type": event, "source": source, "tag_or_addr": tag,
-                     "old_value": old, "new_value": new, "raw_hex": "", "notes": notes})
+                     "old_value": old, "new_value": new, "raw_hex": "", "notes": notes,
+                     "window_ms": 100 if event == "PLC_CHANGED" else ""})
 
     plc = "Rockwell (pycomm3)@10.0.40.11"
     add(now, "PLC_CONNECTED", plc, notes="Polling started")

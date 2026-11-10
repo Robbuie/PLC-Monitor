@@ -10,6 +10,7 @@ Each driver exposes:
   connect()         -> (bool, error_str)
   disconnect()
   read_tag(tag)     -> (value, error_str | None)
+  read_tags(tags)   -> {tag: (value, error_str | None[, seen_ns])}
   is_connected()    -> bool
 """
 
@@ -18,6 +19,8 @@ import contextlib
 import importlib
 import socket as _socket_module
 from typing import Any
+
+from app.engine import clock
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +75,15 @@ class PLCDriver:
     def read_tag(self, tag: str) -> tuple[Any, str | None]:
         raise NotImplementedError
 
+    def read_tags(self, tags: list[str]) -> dict[str, tuple]:
+        """Read several tags. The default reads them one at a time and stamps
+        each as its answer arrives; a driver that can batch overrides this."""
+        out: dict[str, tuple] = {}
+        for tag in tags:
+            value, err = self.read_tag(tag)
+            out[tag] = (value, err, clock.now_ns())
+        return out
+
     def is_connected(self) -> bool:
         return False
 
@@ -115,7 +127,15 @@ class RockwellDriver(PLCDriver):
             path = f"{self.ip}/{self.slot}"
             self._plc = LogixDriver(path, init_tags=True)
             with _bind_to_source_ip(self.source_ip):
-                self._plc.open()
+                opened = self._plc.open()
+            # pycomm3 reports a refused session by returning False, not by
+            # raising. Before 1.2 that was taken as success: the chip went
+            # green and every read failed with a message about Forward Open.
+            if opened is False:
+                self.disconnect()
+                return False, ("The device took the connection but did not register an "
+                               "EtherNet/IP session. Check the IP address, and that it is a "
+                               "ControlLogix/CompactLogix.")
             return True, ""
         except Exception as e:
             self._plc = None
@@ -148,6 +168,32 @@ class RockwellDriver(PLCDriver):
             return result.value, None
         except Exception as e:
             return None, str(e)
+
+    def read_tags(self, tags: list[str]) -> dict[str, tuple]:
+        """All tags in one call: pycomm3 packs them into as few
+        multi-service requests as fit, so ten tags cost one round trip, not
+        ten. If the batch as a whole fails (a malformed name can make pycomm3
+        raise rather than report), fall back to one at a time, so one bad tag
+        costs speed rather than every other tag's value."""
+        if not self._plc:
+            return {t: (None, "Not connected") for t in tags}
+        if len(tags) == 1:
+            return {tags[0]: self.read_tag(tags[0])}
+        try:
+            results = self._plc.read(*tags)
+        except Exception:
+            return super().read_tags(tags)
+        if not isinstance(results, list) or len(results) != len(tags):
+            return super().read_tags(tags)
+        out: dict[str, tuple] = {}
+        for tag, result in zip(tags, results):
+            if result is None:
+                out[tag] = self.read_tag(tag)
+            elif result.error:
+                out[tag] = (None, f"{result.error}  (tag: {tag})")
+            else:
+                out[tag] = (result.value, None)
+        return out
 
     def is_connected(self) -> bool:
         return self._plc is not None
@@ -275,6 +321,25 @@ class RockwellLibplctagDriver(PLCDriver):
 # Siemens S7  (python-snap7)
 # ---------------------------------------------------------------------------
 
+def _s7_areas():
+    """snap7's area enum, wherever this version keeps it.
+
+    python-snap7 1.x has `snap7.types.Areas`; 2.x renamed the module to
+    `snap7.type`; 3.x (pure Python, what pip installs today) keeps
+    `snap7.type.Areas` and adds `snap7.Area`. Before 1.2 only the 1.x name was
+    tried, so on a current install every M, I and Q tag failed to read.
+    """
+    for name in ("snap7.type", "snap7.types"):
+        try:
+            areas = getattr(importlib.import_module(name), "Areas", None)
+        except ImportError:
+            continue
+        if areas is not None:
+            return areas
+    import snap7
+    return snap7.Area
+
+
 class SiemensDriver(PLCDriver):
     """
     Siemens S7-300/400/1200/1500 via python-snap7.
@@ -360,7 +425,8 @@ class SiemensDriver(PLCDriver):
 
             elif tag.startswith("M") or tag.startswith("I") or tag.startswith("Q"):
                 area_char = tag[0]
-                area_map = {"M": snap7.types.Areas.MK, "I": snap7.types.Areas.PE, "Q": snap7.types.Areas.PA}
+                areas = _s7_areas()
+                area_map = {"M": areas.MK, "I": areas.PE, "Q": areas.PA}
                 byte_off, bit = map(int, tag[1:].split("."))
                 data = self._client.read_area(area_map[area_char], 0, byte_off, 1)
                 return s7util.get_bool(data, 0, bit), None

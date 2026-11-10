@@ -43,6 +43,24 @@ EVENT_CHOICES = [("Received", ("SOCK_RECV",)), ("Sent", ("SOCK_SENT",)),
                  ("Either", ("SOCK_RECV", "SOCK_SENT"))]
 
 
+
+def window_note(windows: dict) -> str:
+    """One sentence on how far the trigger stamps can be trusted.
+
+    A tag change is stamped when the poll that saw it returned; the change
+    itself happened somewhere since the poll before. So every latency here is
+    a lower bound, short by up to that window. Saying so next to the numbers
+    keeps a 100 ms poll from being read as 1 ms accuracy.
+    """
+    if not windows:
+        return ""
+    typical = ""
+    if round(windows["median"]) != round(windows["max"]):
+        typical = f", typically within {windows['median']:,.0f} ms"
+    return (f" Tag changes were seen up to {windows['max']:,.0f} ms after they happened"
+            f" (the poll window{typical}), so each latency can be that much longer"
+            f" than shown.")
+
 class MatcherEditor(QWidget):
     """One side of the measurement: a PLC change, or a socket message."""
 
@@ -344,7 +362,8 @@ class LatencyPage(Page):
             self.summary.setText(f"No triggers found: {label}.")
         else:
             spread = f" Standard deviation {stats['stdev']:,.1f} ms." if stats else ""
-            self.summary.setText(f"{len(result.pairs):,} triggers: {label}.{spread}")
+            self.summary.setText(f"{len(result.pairs):,} triggers: {label}.{spread}"
+                                 + window_note(result.window_stats()))
         self.export_btn.setEnabled(bool(result.pairs))
         self._draw(result.answered)
 
@@ -409,12 +428,13 @@ class LatencyPage(Page):
         with open(path, "w", newline="", encoding="utf-8") as handle:
             out = csv.writer(handle)
             out.writerow(["trigger_ms", "trigger_time", "trigger", "response_ms", "response",
-                          "latency_ms"])
+                          "latency_ms", "trigger_window_ms"])
             for p in self._result.pairs:
                 out.writerow([p.trigger_ms,
                               datetime.fromtimestamp(p.trigger_ms / 1000).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
                               p.trigger_text, p.response_ms or "", p.response_text,
-                              "" if p.delta_ms is None else p.delta_ms])
+                              "" if p.delta_ms is None else p.delta_ms,
+                              "" if p.trigger_window_ms is None else p.trigger_window_ms])
         self.session.status.emit(f"Saved {path}")
 
     def shown(self) -> None:

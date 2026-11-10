@@ -60,7 +60,9 @@ def run(config_path: str | None = None, stop_event: threading.Event | None = Non
         max_rotated=int(lg.get("max_rotated", 30)),
         rotate_daily=bool(lg.get("rotate_daily", True)),
     )
-    logger.log(EV_INFO, "Runner", notes=f"Headless runner started (config {config_path})")
+    from app.engine import clock
+    logger.log(EV_INFO, "Runner", notes=f"Headless runner started (config {config_path}; "
+                                        f"clock {clock.SOURCE})")
     log.info("Logging to %s", lg["log_path"])
 
     def status(msg: str) -> None:

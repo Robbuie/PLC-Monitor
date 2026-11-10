@@ -58,14 +58,24 @@ It is also useful on its own as:
 
 ## How accurate is it?
 
-- **Socket messages** are stamped when the PC sees them -- within a
-  millisecond or two.
+- **Socket messages** in Passive sniff are stamped with the time the network
+  adapter captured the packet (Npcap's own timestamp), so the PC being busy
+  does not shift them. A message split over several packets takes the time of
+  the first. A packet the sender had to send again (a TCP retransmission) is
+  not logged a second time. Proxy, Server and UDP stamp when the data arrives
+  -- within a millisecond or two.
 - **Tag changes** are stamped when the poll that saw them returns. The real
-  change happened some time during the last poll interval, so a tag-to-message
-  measurement can read up to one poll interval *short*. At the default 100 ms,
-  treat results as +/- 100 ms; for tighter numbers lower *Poll every* (and keep
-  the tag list short -- each poll reads every tag), or watch both sides on the
-  network instead of polling.
+  change happened some time since the poll before, so a tag-to-message
+  measurement can read *short* by up to that gap. Each change records the gap
+  in the log (`window_ms`), and the **Latency** page says how big it was next
+  to the results. At the default 100 ms, treat results as up to 100 ms longer
+  than shown; for tighter numbers lower *Poll every*, or watch both sides on
+  the network instead of polling.
+- All the tags are read **in one request** where the PLC allows it (Rockwell
+  with either driver), so a longer tag list costs little. Siemens and
+  Mitsubishi tags are still read one after another; each is stamped as its own
+  answer comes back, but a long list makes every poll -- and so the window --
+  longer.
 - *Changes* only catches what a poll sees: a bit that goes on and off again
   between two polls is never logged. If it matters, have the PLC latch it or
   count it, and monitor the latch or counter.
@@ -229,7 +239,10 @@ pairs every occurrence in the chosen log and shows:
 - every pair, and a histogram with the 95th percentile marked.
 
 A response that arrives after the *next* trigger is credited to that trigger,
-not the earlier one. **Export CSV** saves every pair for a report.
+not the earlier one. Under the results, a sentence says how long after
+happening the tag changes were seen (the poll window): each latency can be up
+to that much longer than shown. **Export CSV** saves every pair, with each
+trigger's window, for a report.
 
 ### Network
 
@@ -282,6 +295,7 @@ change twice; stop the service first, or just watch the Live log.
 | `old_value` / `new_value` | For tag changes |
 | `raw_hex` | Socket payload as hex |
 | `notes` | Decoded payload text, or error detail |
+| `window_ms` | For a tag change: ms since the previous read of that tag. The change happened inside this window. (Added in 1.2; a log begun by an older version is archived and a new one started.) |
 
 ## Tag formats
 
@@ -326,7 +340,9 @@ tag whose values are text appears in the Live log but not on the Trend page.
 
 ## Building from source
 
-Python 3.11+ on Windows.
+Python 3.11+ on Windows; the release is built with 3.13. (Before 3.13,
+Python's clock on Windows only ticks every 15.6 ms; PLC Monitor reads the
+precise Windows clock itself when it has to, so either works.)
 
 ```
 python -m venv .venv
@@ -345,6 +361,34 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.2.0 -- 2026-11-09
+
+Timestamps you can trust to the millisecond.
+
+- Every row is stamped with the precise Windows clock. Builds on Python
+  before 3.13 (including every release so far) stamped with a clock that
+  only moved every 15.6 ms.
+- Passive sniff stamps each message with the time the adapter captured it,
+  takes the first packet's time for a message split over several, and no
+  longer logs a TCP retransmission as a second message. Data that arrived
+  with, or just before, a connection's FIN is logged before the disconnect
+  instead of being dropped.
+- Rockwell tags are read in one request per poll (pycomm3 and libplctag), so
+  a longer tag list no longer stretches every poll. A device that refuses
+  packed requests is detected and read one tag at a time.
+- Each tag change records its poll window (`window_ms`). The Latency page
+  says how much longer each latency could be, and the export includes it.
+- Latency pairs rows by time even when they were written slightly out of
+  order (a captured packet is stamped before it is written).
+- Fixed: Siemens M, I and Q tags failed with "no attribute 'types'" on the
+  current python-snap7.
+- Fixed: a Rockwell (pycomm3) device that refused the EtherNet/IP session was
+  shown as connected, and every read then failed.
+- Fixed: libplctag logged an error code as the value when a tag returned no
+  data, and retried a tag it could not create on every poll, holding up the
+  others each time.
+- The log is written as UTF-8, so payload text in any language is kept.
 
 ### 1.1.0 -- 2026-10-05
 
