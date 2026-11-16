@@ -74,6 +74,11 @@ def _number(text: str) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def number(text: str) -> float | None:
+    """A logged value as a number: True/False as 1/0, None when it is not one."""
+    return _number(text)
+
+
 # --------------------------------------------------------------------------
 # Trend
 # --------------------------------------------------------------------------

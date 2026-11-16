@@ -1,6 +1,7 @@
 # Runtime dependencies. Every one ships inside the installer.
 PySide6>=6.7
-matplotlib>=3.7          # Trend and Latency charts
+matplotlib>=3.7          # Latency chart
+pyqtgraph>=0.13.3        # Trend chart (MIT): fast pan and zoom over a day of changes
 psutil>=5.9              # Connections, adapter names
 
 # PLC drivers. Each is imported only when its PLC family is chosen, so a

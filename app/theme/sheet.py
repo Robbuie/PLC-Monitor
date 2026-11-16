@@ -237,6 +237,8 @@ QPushButton[role="quiet"], QToolButton[role="quiet"] {{
     color: {txt_1};
 }}
 QPushButton[role="quiet"]:hover, QToolButton[role="quiet"]:hover {{ background: {bg_3}; color: {txt_0}; }}
+/* A quiet button that stays on (Trend's Cursors) shows it as the nav tools do. */
+QPushButton[role="quiet"]:checked {{ background: {accent_soft}; color: {accent_ink}; }}
 QToolButton[role="nav"] {{
     background: transparent;
     border: none;

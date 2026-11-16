@@ -137,7 +137,7 @@ def test_trend_draws_text_tags_and_finds_a_vehicle(window):
     tr.plot()
     assert wait(app, lambda: not tr._loading and tr._lanes)
     lane = tr._lanes[0]
-    assert [v for _b, _f, v in lane["segments"]] == ["0UNKNOWN", "A1234567", "0UNKNOWN",
+    assert [v for _b, _f, v in lane["series"].segments()] == ["0UNKNOWN", "A1234567", "0UNKNOWN",
                                                      "A1234569", "0UNKNOWN"]
     tr.finder.setText("1234569")
     app.processEvents()
@@ -146,7 +146,8 @@ def test_trend_draws_text_tags_and_finds_a_vehicle(window):
     tr._step(1)
     assert tr.find_log.isEnabled() and "A1234569" in tr.chart_status.text() or \
         "1234569" in tr.chart_status.text()
-    shown = [t.get_text() for t in lane["labels"]]
+    app.processEvents()
+    shown = [value for _rect, value in lane["item"].labels_for_view()]
     assert "A1234569" in shown                          # labelled once zoomed in
 
     # Show in log: the Live log opens the same file, at that change.

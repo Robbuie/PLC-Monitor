@@ -1,13 +1,22 @@
-"""Trend: tag values over time, from the live log or any archive.
+"""Trend: tag values over time, from the live log or any archive, or live.
 
-matplotlib, drawn in the theme's own colours and redrawn when the theme
-changes. Lines come from the validated series palette (tokens.SERIES_LIGHT /
-SERIES_DARK), assigned to a tag the first time it is plotted and kept: a tag is
-the same colour all session however many others are ticked. Eight at most --
-a ninth line is a chart nobody can read, so the list says so instead.
+Drawn with pyqtgraph (app/ui/trendchart.py) in the theme's own colours, and
+redrawn when the theme changes. Lines come from the validated series palette
+(tokens.SERIES_LIGHT / SERIES_DARK), assigned to a tag the first time it is
+plotted and kept: a tag is the same colour all session however many others
+are ticked. Eight at most -- a ninth line is a chart nobody can read, so the
+list says so instead.
 
-A log records changes, not samples, so each change is drawn as a step at the
-moment it happened (logdata.series keeps the old value as well as the new).
+A log records changes, not samples, so each value is drawn as a level from
+the moment it was logged until the next change (engine/trendview.py). When
+there are more changes in view than pixels across, each pixel column is drawn
+as a stroke from the lowest to the highest value held in it, so a spike of a
+few milliseconds in a day-long view is still there to see.
+
+**Live** follows the PLC: the chart is fed from the rows the monitor logs as
+they happen (Session.events), not by reading the file again, and scrolls to
+keep now at the right edge. Panning or zooming by hand stops the scrolling so
+the moment being looked at stays put; Home picks it up again.
 
 A tag whose values are text -- a VIN, a recipe, a status word -- is drawn as a
 strip under the charts: one span per value, labelled where there is room,
@@ -23,6 +32,8 @@ RobControl, which is most of the PCs this goes on.
 
 from __future__ import annotations
 
+import csv
+import math
 import os
 import threading
 import time
@@ -30,23 +41,32 @@ from datetime import datetime, timedelta
 
 from PySide6.QtCore import QDateTime, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateTimeEdit,
     QFileDialog,
+    QInputDialog,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
+    QSizePolicy,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from app.core import siblings
-from app.engine import logdata, robdata
+from app.engine import logdata, robdata, trendmath, trendprefs, trendview
+from app.engine.trendview import StepSeries, TextSeries
 from app.theme import sheet
 from app.theme.tokens import LIGHT_THEMES, SERIES_DARK, SERIES_LIGHT
 from app.ui import widgets as w
 from app.ui.pages.base import Page
+from app.engine.trendview import duration
+from app.ui.trendpens import PenDialog, PenTable, stamp
+from app.ui.trendtools import CompareDialog, MathDialog
 
 PRESETS = [("Last 30 seconds", 0.5), ("Last minute", 1), ("Last 5 minutes", 5),
            ("Last 15 minutes", 15), ("Last 30 minutes", 30), ("Last hour", 60),
@@ -58,20 +78,51 @@ MAX_LINES = 8
 #: Roles on a tag-list item: the tag's name, and "number" or "text".
 TAG_ROLE = Qt.UserRole + 1
 KIND_ROLE = Qt.UserRole + 2
-#: A span narrower than this many pixels is not labelled: the text would
-#: overlap its neighbours. Zooming in labels it.
-LABEL_MIN_PX = 46
+#: Live: how often the chart scrolls and redraws, and how often RobControl's
+#: recording is read again (it samples a robot every 2 s at the fastest).
+LIVE_TICK_MS = 250
+ROBOT_EVERY_TICKS = 20
+#: Find marks at most this many places; past that the lines are a solid wash.
+MAX_MARKS = 5000
+EMPTY_TEXT = "Pick tags on the left and press Plot, or turn on Live."
+
+
+class Choice(QComboBox):
+    """A short drop-down with Segments' value()/set_value()/changed, for a
+    header with no room for a row of buttons. set_value does not announce."""
+
+    changed = Signal(str)
+
+    def __init__(self, options: list[tuple[str, str]], tips: dict | None = None) -> None:
+        super().__init__()
+        for key, text in options:
+            self.addItem(text, key)
+            if tips and key in tips:
+                self.setItemData(self.count() - 1, tips[key], Qt.ToolTipRole)
+        self.currentIndexChanged.connect(lambda _i: self.changed.emit(self.value()))
+
+    def value(self) -> str:
+        return self.currentData() or ""
+
+    def set_value(self, key: str) -> None:
+        index = self.findData(key)
+        if index >= 0:
+            self.blockSignals(True)
+            self.setCurrentIndex(index)
+            self.blockSignals(False)
 
 
 class TrendPage(Page):
     key = "trend"
     title = "Trend"
     glyph = "trend"
-    blurb = "Tag values over time, from the live log or an archive, with RobControl's robot signals."
+    blurb = "Tag values over time, live or from a log, with RobControl's robot signals."
 
     _loaded = Signal(object, list, str)
     _tags_found = Signal(str, list)
     _robots_found = Signal(str, list, str)
+    _robots_more = Signal(object)
+    _compared = Signal(object, str)
 
     def __init__(self, session, parent=None) -> None:
         super().__init__(session, parent)
@@ -79,12 +130,25 @@ class TrendPage(Page):
         self._extra_files: list[str] = []
         self._robot_files: list[str] = []
         self._signals: dict[str, robdata.RobotSignal] = {}
-        self._lines = []
+        self._lines: list[dict] = []
+        self._lanes: list[dict] = []
         self._loading = False
+        self._last: tuple | None = None        # (data, names, label) of the last render
+        self._held: list[dict] = []            # live rows that arrived while loading
+        self._following = True
+        self._ticks = 0
+        self._live_robots: list = []
+        self._robot_db = ""
+        self._robots_busy = False
+        self.chart = None
+        self._sources: dict[str, StepSeries] = {}      # PLC tags read, shown or behind a math pen
+        self._dirty = False
+        self._compare: tuple[str, float, str] | None = None
+        self.cycle_view = None
 
         top = w.Card()
         self.source = QComboBox()
-        self.source.setMinimumWidth(260)
+        self.source.setMinimumWidth(240)
         browse = w.button("Open file...", slot=self._browse,
                           tip="Any PLC Monitor CSV or .csv.gz, including logs from another PC.")
         self.range = QComboBox()
@@ -99,19 +163,48 @@ class TrendPage(Page):
         self.between = w.hbox(w.label("from", "hint"), self.start, w.label("to", "hint"), self.end,
                               spacing=6)
         self.between.setVisible(False)
-        self.arrange = w.Segments([("stacked", "One per tag"), ("shared", "Together")])
-        self.arrange.set_tip("stacked", "A chart per tag on the same time axis. Tags with "
-                             "different ranges stay readable.")
-        self.arrange.set_tip("shared", "Every tag on one axis. Only useful when their values "
-                             "are of a similar size.")
-        self.arrange.changed.connect(lambda _k: self.plot() if (self._lines or self._lanes) else None)
+        self.arrange = Choice(
+            [("stacked", "Chart per tag"), ("same", "Same scale"), ("shared", "One chart")],
+            {"stacked": "A chart per tag on the same time axis. Tags with different ranges "
+                        "stay readable.",
+             "same": "A chart per tag, all on one value scale, so their sizes compare. A tag "
+                     "with a fixed scale keeps it.",
+             "shared": "Every tag on one chart. Only useful when their values are of a "
+                       "similar size."})
+        self.arrange.setToolTip("How the tags share the charts.")
+        self.arrange.changed.connect(lambda _k: self._rerender())
         self.plot_btn = w.button("Plot", "primary", icon_name="trend", slot=self.plot)
-        self.auto = w.Switch()
-        export = w.button("Export PNG", icon_name="download", slot=self._export)
+        self.live = w.Switch()
+        self.live.setToolTip("Follow the PLC as it changes: the chart scrolls with the values "
+                             "the monitor is logging now. Reads the live log.")
+        live_label = w.label("Live", "hint")
+        live_label.setToolTip(self.live.toolTip())
+        self.view = w.Segments([("time", "Time"), ("cycles", "Cycles")])
+        self.view.set_tip("time", "The tags over time.")
+        self.view.set_tip("cycles", "Every cycle laid over the others, from a trigger: the odd "
+                          "one out stands out.")
+        self.view.changed.connect(self._view_changed)
+        self.compare_btn = w.button("Compare", tip="Draw the same tags from another time -- "
+                                    "yesterday, last week, another log -- dashed, on this chart.",
+                                    slot=self._compare_dialog)
+        self.layouts_btn = w.button("Layouts", tip="Saved sets of tags, robots, arrangement "
+                                    "and range for this profile.")
+        self.layouts_menu = QMenu(self)
+        self.layouts_menu.aboutToShow.connect(self._fill_layouts_menu)
+        self.layouts_btn.setMenu(self.layouts_menu)
+        export = w.button("Export", icon_name="download")
+        self.export_menu = QMenu(self)
+        self.export_menu.addAction("Chart as PNG...", self._export)
+        self.export_menu.addAction("Data in view as CSV...", lambda: self._export_csv(False))
+        self.export_cursors_action = self.export_menu.addAction(
+            "Data between the cursors as CSV...", lambda: self._export_csv(True))
+        self.export_menu.aboutToShow.connect(lambda: self.export_cursors_action.setEnabled(
+            self.chart is not None and self.chart.cursors is not None))
+        export.setMenu(self.export_menu)
         top.body.addLayout(w.row(w.label("Source", "fieldlabel"), self.source, browse, 16,
                                  w.label("Range", "fieldlabel"), self.range, self.between, None,
-                                 self.auto, w.label("Refresh every 30 s", "hint"), 8,
-                                 self.plot_btn, export))
+                                 self.compare_btn, self.layouts_btn, 12, self.live,
+                                 live_label, 8, self.plot_btn, export))
         self.body.addWidget(top)
 
         split = QSplitter(Qt.Horizontal)
@@ -131,6 +224,10 @@ class TrendPage(Page):
         tags_card.body.addWidget(self.tag_list, 1)
         self.tag_note = w.label("", "hint", wrap=True)
         tags_card.body.addWidget(self.tag_note)
+        tags_card.body.addWidget(w.button(
+            "New math pen...", "quiet", icon_name="plus", slot=self._new_math,
+            tip="A pen worked out from others: A minus B, a counter's rate, how long a state "
+                "lasted."))
         self.left.addWidget(tags_card)
 
         robots_card = w.Card("Robots")
@@ -153,6 +250,27 @@ class TrendPage(Page):
         self.left.addWidget(robots_card)
         self.robots_card = robots_card
 
+        events_card = w.Card("Events")
+        events_card.title.setToolTip("Markers on the time axis, under the charts. Click one "
+                                     "to see it in the Live log.")
+        self.show_events = QCheckBox("Socket messages")
+        self.show_events.setToolTip("Received and sent messages, connections and errors, "
+                                    "from the same log.")
+        self.show_pairs = QCheckBox("Latency pairs")
+        self.pairs_note = w.label("", "hint", wrap=True)
+        for box in (self.show_events, self.show_pairs):
+            box.toggled.connect(lambda _on: self.plot() if (self._lines or self._lanes) else None)
+            events_card.body.addWidget(box)
+        events_card.body.addWidget(self.pairs_note)
+        self.left.addWidget(events_card)
+        self.events_card = events_card
+        events_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.tag_list.setMinimumHeight(110)
+        self.left.setStretchFactor(0, 4)
+        self.left.setStretchFactor(1, 2)
+        self.left.setStretchFactor(2, 0)
+        session.latencySpecChanged.connect(self._pairs_note)
+
         self.left.setMinimumWidth(220)
         self.left.setMaximumWidth(340)
         split.addWidget(self.left)
@@ -161,41 +279,92 @@ class TrendPage(Page):
         # The status goes under the chart, not in the header: with Find there
         # too, a long status pushed the header's controls off the card.
         self.chart_status = w.label("", "hint")
+        chart_card.title.setVisible(False)
+        # The view switch stays at the left in both views; the time tools
+        # are on the right and go away in Cycles.
+        chart_card.header.insertWidget(1, self.view)
+        self._time_tools = [self.arrange]
         chart_card.add_action(self.arrange)
         chart_card.header.addSpacing(10)
-        self.home_btn = w.tool("home", "Back to the whole range", lambda: self._nav("home"))
-        self.pan_btn = w.tool("pan", "Drag to pan", lambda: self._nav("pan"))
-        self.zoom_btn = w.tool("search", "Drag a box to zoom", lambda: self._nav("zoom"))
+        self.home_btn = w.tool("home", "Back to the whole range (in Live: follow now again)",
+                               lambda: self._nav("home"))
+        self.view_back = w.tool("back", "The view before this one", lambda: self._nav("back"))
+        self.view_forward = w.tool("forward", "The next view again", lambda: self._nav("forward"))
+        self.view_back.setEnabled(False)
+        self.view_forward.setEnabled(False)
+        self.pan_btn = w.tool("pan", "Drag to move along the time axis. The wheel zooms it.",
+                              lambda: self._nav("pan"))
+        self.zoom_btn = w.tool("search", "Drag a box to zoom to that time", lambda: self._nav("zoom"))
         for button in (self.pan_btn, self.zoom_btn):
             button.setCheckable(True)
-        for button in (self.home_btn, self.pan_btn, self.zoom_btn):
+        self.pan_btn.setChecked(True)
+        for button in (self.home_btn, self.view_back, self.view_forward, self.pan_btn,
+                       self.zoom_btn):
             chart_card.add_action(button)
+        chart_card.header.addSpacing(10)
+        self.cursor_btn = w.button("Cursors", "quiet",
+                                   tip="Two cursors, A and B, to measure between. Drag them, or "
+                                       "click a chart to move the nearer one. They snap to the "
+                                       "nearest change; hold Shift to place one freely.")
+        self.cursor_btn.setCheckable(True)
+        self.cursor_btn.toggled.connect(self._cursors_toggled)
+        chart_card.add_action(self.cursor_btn)
         chart_card.header.addSpacing(10)
         self.finder = QLineEdit()
         self.finder.setProperty("role", "search")
         self.finder.setPlaceholderText("Find a value")
         self.finder.setClearButtonEnabled(True)
-        self.finder.setFixedWidth(180)
+        self.finder.setFixedWidth(140)
         self.finder.setToolTip("Marks every change to a value containing this text, on the "
                              "charts and the text strips. Enter or the arrows step through them.")
         self.finder.textChanged.connect(lambda _t: self._find_changed())
         self.finder.returnPressed.connect(lambda: self._step(1))
-        self.find_prev = w.tool("back", "Previous match", lambda: self._step(-1))
-        self.find_next = w.tool("forward", "Next match", lambda: self._step(1))
+        self.find_prev = w.tool("sort_up", "Previous match", lambda: self._step(-1))
+        self.find_next = w.tool("sort_down", "Next match", lambda: self._step(1))
         self.find_log = w.tool("log", "Show this match in the Live log, with the events "
                                       "either side of it", self._show_in_log)
         self.find_log.setEnabled(False)
         for widget in (self.finder, self.find_prev, self.find_next, self.find_log):
             chart_card.add_action(widget)
+        self._time_tools += [self.home_btn, self.view_back, self.view_forward, self.pan_btn,
+                             self.zoom_btn, self.cursor_btn, self.finder, self.find_prev,
+                             self.find_next, self.find_log]
         self._matches: list = []
         self._match_at = -1
-        self._marks: list = []
-        self._lanes: list = []
         self.chart_holder = QWidget()
         self.chart_layout = QVBoxLayout(self.chart_holder)
         self.chart_layout.setContentsMargins(0, 0, 0, 0)
-        chart_card.body.addWidget(self.chart_holder, 1)
+        # The chart over its value bar, with a handle between them.
+        self.chart_split = QSplitter(Qt.Vertical)
+        self.chart_split.setChildrenCollapsible(False)
+        self.chart_split.setHandleWidth(8)
+        self.chart_split.addWidget(self.chart_holder)
+        values = QWidget()
+        values_layout = QVBoxLayout(values)
+        values_layout.setContentsMargins(0, 0, 0, 0)
+        values_layout.setSpacing(4)
+        self.cursor_info = w.label("", "hint")
+        self.cursor_info.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        values_layout.addWidget(self.cursor_info)
+        self.pen_table = PenTable()
+        self.pen_table.edit.connect(self._edit_pen)
+        self.pen_table.nextFlag.connect(self._next_flag)
+        values_layout.addWidget(self.pen_table, 1)
+        self.chart_split.addWidget(values)
+        self.chart_split.setStretchFactor(0, 1)
+        self.chart_split.setStretchFactor(1, 0)
+        self.values_panel = values
+        values.setVisible(False)
+        self.views = QStackedWidget()
+        self.views.addWidget(self.chart_split)
+        chart_card.body.addWidget(self.views, 1)
         chart_card.body.addWidget(self.chart_status)
+        self.chart_card = chart_card
+        self._pointer: float | None = None
+        self._stats_timer = QTimer(self)
+        self._stats_timer.setSingleShot(True)
+        self._stats_timer.setInterval(60)
+        self._stats_timer.timeout.connect(self._update_stats)
         split.addWidget(chart_card)
         split.setStretchFactor(1, 1)
 
@@ -203,82 +372,64 @@ class TrendPage(Page):
 
         self.range.currentIndexChanged.connect(
             lambda: self.between.setVisible(self.range.currentData() == -1))
-        self.source.currentIndexChanged.connect(lambda _i: self.reload_tags())
+        self.source.currentIndexChanged.connect(lambda _i: self._source_changed())
         self.tag_list.itemChanged.connect(self._ticked)
         self.robot_list.itemChanged.connect(self._ticked)
         self.robot_source.currentIndexChanged.connect(lambda _i: self.reload_robots())
         self._loaded.connect(self._render)
         self._tags_found.connect(self._fill_tags)
         self._robots_found.connect(self._fill_robots)
+        self._robots_more.connect(self._robot_samples)
+        self._compared.connect(self._show_compare)
+        self.tag_list.itemDoubleClicked.connect(self._tag_double_clicked)
         self._timer = QTimer(self)
-        self._timer.setInterval(30_000)
-        self._timer.timeout.connect(self.plot)
-        self.auto.toggled.connect(lambda on: self._timer.start() if on else self._timer.stop())
+        self._timer.setInterval(LIVE_TICK_MS)
+        self._timer.timeout.connect(self._tick)
+        self.live.toggled.connect(self._live_toggled)
+        session.events.connect(self._live_rows)
         session.logPathChanged.connect(lambda _p: self.refresh_sources())
         self.refresh_sources()
         self.refresh_robot_sources()
+        self._pairs_note()
 
     # ------------------------------------------------------------- chart
 
     def _build_chart(self) -> None:
+        self.empty_label = w.label(EMPTY_TEXT, "hint", wrap=True)
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.chart_layout.addWidget(self.empty_label, 1)
         try:
-            import matplotlib
-            matplotlib.use("QtAgg")
-            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
-            from matplotlib.figure import Figure
-        except Exception as exc:  # pragma: no cover - only without matplotlib
-            self.figure = None
-            self.chart_layout.addWidget(w.label(
-                f"matplotlib is not available in this build, so there is no chart. ({exc})",
-                "hint", wrap=True))
+            from app.ui.trendchart import TrendChart
+        except Exception as exc:  # pragma: no cover - only without pyqtgraph
+            self.chart = None
+            self.empty_label.setText(
+                f"pyqtgraph is not available in this build, so there is no chart. ({exc})")
             return
-        self.figure = Figure(figsize=(8, 4), dpi=100)
-        self.axes = self.figure.add_subplot(111)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        # matplotlib's own toolbar does the work but is not shown: its icons
-        # are its own and do not follow the theme. The three buttons in the
-        # card's header drive it instead.
-        self.toolbar = NavigationToolbar2QT(self.canvas, self.chart_holder)
-        self.toolbar.setVisible(False)
-        self.chart_layout.addWidget(self.canvas, 1)
-        self._tip = None
-        self.canvas.mpl_connect("motion_notify_event", self._hover)
-        self._style()
-        self._empty("Pick tags on the left and press Plot.")
-
-    def _style(self, ax=None) -> None:
-        if self.figure is None:
-            return
-        t = sheet.tokens()
-        self.figure.set_facecolor(t["bg_2"])
-        ax = ax or self.axes
-        ax.set_facecolor(t["bg_2"])
-        for side, spine in ax.spines.items():
-            spine.set_visible(side in ("bottom", "left"))
-            spine.set_color(t["line"])
-        ax.tick_params(colors=t["txt_2"], labelsize=8, length=3)
-        ax.yaxis.label.set_color(t["txt_2"])
-        ax.xaxis.label.set_color(t["txt_2"])
-        ax.grid(True, axis="y", color=t["line_soft"], linewidth=0.8)
-        ax.set_axisbelow(True)
+        self.chart = TrendChart()
+        self.chart.moved.connect(self._moved)
+        self.chart.hovered.connect(self._hovered)
+        self.chart.cursorsMoved.connect(self._cursors_moved)
+        self.chart.viewChanged.connect(lambda: self._stats_timer.start())
+        self.chart.historyChanged.connect(self._history)
+        self.chart.eventClicked.connect(self._event_clicked)
+        from app.ui.trendcycles import CycleView
+        self.cycle_view = CycleView()
+        self.cycle_view.jump.connect(self._jump_to_cycle)
+        self.views.addWidget(self.cycle_view)
+        self.chart_layout.addWidget(self.chart, 1)
+        self._empty(EMPTY_TEXT)
 
     def _empty(self, text: str) -> None:
-        if self.figure is None:
-            return
-        self.figure.clear()
-        self._lanes = []
-        self._marks = []
-        self._matches = []
-        self.axes = self.figure.add_subplot(111)
-        self._axes = [self.axes]
-        ax = self.axes
-        self._style()
-        self.figure.subplots_adjust(left=0.07, right=0.98, top=0.95, bottom=0.14)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.text(0.5, 0.5, text, transform=ax.transAxes, ha="center", va="center",
-                color=sheet.tokens()["txt_2"], fontsize=10)
-        self.canvas.draw_idle()
+        self._lines, self._lanes, self._matches = [], [], []
+        self._last = None
+        if hasattr(self, "values_panel"):
+            self.values_panel.setVisible(False)
+            self.pen_table.show_pens([])
+        self.empty_label.setText(text)
+        self.empty_label.setVisible(True)
+        if self.chart is not None:
+            self.chart.clear_all()
+            self.chart.setVisible(False)
 
     def _palette(self) -> tuple[str, ...]:
         return SERIES_LIGHT if sheet.tokens().get("theme_name") in LIGHT_THEMES else SERIES_DARK
@@ -349,6 +500,7 @@ class TrendPage(Page):
             on = tag in ticked if ticked else index < 4
             item.setCheckState(Qt.Checked if on else Qt.Unchecked)
             self.tag_list.addItem(item)
+        self._add_math_items(ticked)
         self.tag_list.blockSignals(False)
         self._ticked()
         if not tags:
@@ -457,8 +609,11 @@ class TrendPage(Page):
     def _fit_robots_card(self) -> None:
         """Shrink the card to its header and note. Measured once laid out,
         because the note wraps and its height depends on the column width."""
-        if self.robot_list.count():
-            return
+        try:
+            if self.robot_list.count():
+                return
+        except RuntimeError:
+            return      # the page went before the timer fired (a closed window, a test)
         card = self.robots_card
         layout = card.layout()
         layout.activate()
@@ -497,7 +652,7 @@ class TrendPage(Page):
                                   f"draws {MAX_LINES} at most; untick some to choose which.")
             w.set_prop(self.tag_note, "tone", "warn")
         else:
-            self.tag_note.setText(f"{n} of {total} ticked. Booleans plot as 0 and 1; text "
+            self.tag_note.setText(f"{n} of {total} ticked. 0/1 tags draw as lanes; text "
                                   "tags as a strip of values.")
             w.set_prop(self.tag_note, "tone", "")
         if self.robot_list.count() and self.robot_note.property("tone") != "warn":
@@ -517,8 +672,16 @@ class TrendPage(Page):
         start = datetime.now() - timedelta(minutes=minutes)
         return int(start.timestamp() * 1000), None, self.range.currentText().lower()
 
+    def _source_changed(self) -> None:
+        # Live reads the live log; picking an archive is looking at the past.
+        if self.source.currentIndex() != 0 and self.live.isChecked():
+            self.live.setChecked(False)
+        self.reload_tags()
+
+    # -------------------------------------------------------------- plot
+
     def plot(self) -> None:
-        if self.figure is None or self._loading:
+        if self.chart is None or self._loading:
             return
         tags = self._selected()[:MAX_LINES]
         robots = self._selected_robots()[:MAX_LINES - len(tags)]
@@ -531,396 +694,843 @@ class TrendPage(Page):
         names = tags + [signal.name for signal in robots]
         specs = self.session.group_specs()
         self._loading = True
+        self._held = []
         self.chart_status.setText("Loading...")
 
         kinds = self._kinds()
         text_tags = [t for t in tags if kinds.get(t) == "text"]
-        number_tags = [t for t in tags if t not in text_tags]
+        math_tags = [t for t in tags if kinds.get(t) == "math"]
+        number_tags = [t for t in tags if t not in text_tags and t not in math_tags]
+        specs_math = {name: spec for name, spec in
+                      trendprefs.math_pens(self.session.cfg.as_dict()).items() if name in math_tags}
+        # A math pen's sources are read even when they are not ticked.
+        plc_numbers = {t for t, k in kinds.items() if k == "number"}
+        load = list(number_tags)
+        for spec in specs_math.values():
+            for source in (spec["a"], spec["b"]):
+                if source in plc_numbers and source not in load:
+                    load.append(source)
+        want_events = self.show_events.isChecked()
+        latency = self.session.latency_spec if self.show_pairs.isChecked() else None
 
         def work():
-            data: dict = {}
-            if tags:
+            data: dict = {"__robots__": [s.name for s in robots], "__db__": db,
+                          "__signals__": list(robots), "__math__": specs_math,
+                          "__events__": [] if (want_events or latency) else None}
+            if load or text_tags or want_events or latency:
                 try:
-                    # One pass over the file, keeping only the ticked tags'
-                    # changes: a day's log is a few hundred thousand rows.
-                    wanted = set(tags)
-                    rows = [r for r in self.session.log_rows(path, specs)
-                            if r.get("event_type") == "PLC_CHANGED"
-                            and (r.get("tag_or_addr") or "").strip() in wanted]
-                    if number_tags:
-                        data.update(logdata.series(rows, number_tags, start, end))
+                    # One pass over the file, keeping only what is wanted: the
+                    # ticked tags' changes, events, the latency pair rows. A
+                    # day's log is a few hundred thousand rows.
+                    wanted = set(load) | set(text_tags)
+                    rows, pair_rows, events = [], [], []
+                    for r in self.session.log_rows(path, specs):
+                        event = r.get("event_type")
+                        if event == "PLC_CHANGED" and (r.get("tag_or_addr") or "").strip() in wanted:
+                            rows.append(r)
+                        if want_events and trendmath.is_event_row(r):
+                            marker = trendmath.event_of(r)
+                            if marker is not None and (start is None or marker.t * 1000 >= start) \
+                                    and (end is None or marker.t * 1000 <= end):
+                                events.append(marker)
+                        if latency and (latency["trigger"].matches(r)
+                                        or latency["response"].matches(r)):
+                            pair_rows.append(r)
+                    if load:
+                        for tag, (times, values) in logdata.series(
+                                rows, load, start, end).items():
+                            data[tag] = StepSeries.from_datetimes(times, values)
                     if text_tags:
                         data["__text__"] = logdata.text_series(rows, text_tags, start, end)
+                    if latency:
+                        result = logdata.measure(pair_rows, latency["trigger"],
+                                                 latency["response"],
+                                                 window_ms=latency["window_ms"], start_ms=start,
+                                                 end_ms=end, same_value=latency["same_value"])
+                        trigger = latency["trigger"]
+                        events += trendmath.pair_events(
+                            result, trigger.tag if trigger.kind == "plc" else "")
+                    if data["__events__"] is not None:
+                        data["__events__"] = events
                 except OSError as exc:
                     data["__error__"] = str(exc)
             if robots:
                 try:
-                    data.update(robdata.series(db, robots, start, end))
+                    for name, (times, values) in robdata.series(db, robots, start, end).items():
+                        data[name] = StepSeries.from_datetimes(times, values)
                 except robdata.RobDataError as exc:
                     data["__robot_error__"] = str(exc)
             self._loaded.emit(data, names, label)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _render(self, data: dict, tags: list[str], label: str) -> None:
+    def _render(self, data: dict, tags: list[str], label: str, keep_view: bool = False) -> None:
+        """Draw what plot() read. ``data`` maps each tag to a StepSeries (or
+        the (times, values) lists logdata.series gives), and "__text__" to the
+        text tags' spans (or TextSeries)."""
         self._loading = False
+        held, self._held = self._held, []
+        if self.chart is None:
+            return
         problems = []
         if "__error__" in data:
             problems.append(f"Could not read the log: {data['__error__']}")
         if "__robot_error__" in data:
             problems.append(f"Could not read the robots: {data['__robot_error__']}")
+        for tag in tags:
+            if isinstance(data.get(tag), tuple):
+                data[tag] = StepSeries.from_datetimes(*data[tag])
+        # Math pens, from whatever was read (their sources may not be ticked).
+        sources = {k: v for k, v in data.items()
+                   if isinstance(v, StepSeries) and k not in data.get("__math__", {})}
+        for name, spec in data.get("__math__", {}).items():
+            computed = trendmath.compute_math(spec, sources)
+            if computed is None:
+                missing = [x for x in (spec["a"], spec["b"] if spec["op"] in trendmath.NEEDS_B
+                                       else "") if x and x not in sources]
+                problems.append(f"{name} needs {', '.join(missing) or 'its tags'}, not in this log.")
+                computed = StepSeries()
+            data[name] = computed
         texts = data.get("__text__", {})
-        present = [tag for tag in tags if data.get(tag, ([], []))[0]]
-        lanes = [tag for tag in tags if texts.get(tag)]
-        if problems and not present and not lanes:
-            self._empty("\n".join(problems))
+        live = self.live.isChecked()
+        if live:
+            # Live draws every ticked tag, even one with no history yet: its
+            # first change may be a second away.
+            kinds = self._kinds()
+            for tag in tags:
+                if kinds.get(tag) == "text":
+                    texts.setdefault(tag, [])
+                elif not isinstance(data.get(tag), StepSeries):
+                    data[tag] = StepSeries()
+            present = [tag for tag in tags if isinstance(data.get(tag), StepSeries)]
+            lanes = [tag for tag in tags if tag in texts]
+        else:
+            present = [tag for tag in tags
+                       if isinstance(data.get(tag), StepSeries) and len(data[tag])]
+            lanes = [tag for tag in tags if texts.get(tag)]
+        events = data.get("__events__")
+        if not present and not lanes and not events:
+            self._empty("\n".join(problems) if problems else f"No values for these in {label}.")
             self.chart_status.setText("")
             return
-        import matplotlib.dates as mdates
-        from matplotlib.ticker import MaxNLocator
-        t = sheet.tokens()
-        self._lines = []
-        self._lanes = []
-        self._marks = []
-        if not present and not lanes:
-            self._empty(f"No values for these in {label}.")
-            self.chart_status.setText("")
+        previous_view = self.chart.view_range() if keep_view else None
+
+        # The time range: what was asked for where it has ends, else what the
+        # data covers. Up to now for a range counted back from now.
+        start_ms, end_ms, _label = self._window()
+        firsts = [min(e.t for e in events)] if events else []
+        lasts = [max(e.end or e.t for e in events)] if events else []
+        for tag in present:
+            if len(data[tag]):
+                firsts.append(data[tag].first_time)
+                lasts.append(data[tag].last_time)
+        for tag in lanes:
+            series = texts[tag]
+            if isinstance(series, TextSeries):
+                if len(series):
+                    firsts.append(series.begins[0])
+                    lasts.append(series.begins[-1])
+            elif series:
+                firsts.append(series[0][0].timestamp())
+                lasts.append(series[-1][0].timestamp())
+        now = time.time()
+        fixed = self.range.currentData() == -1
+        if fixed and start_ms is not None:
+            left = start_ms / 1000
+        elif live and start_ms is not None:
+            left = start_ms / 1000
+        else:
+            left = min(firsts) if firsts else now - self._window_seconds()
+        if end_ms:
+            right = end_ms / 1000
+        else:
+            right = max(lasts) if lasts else now
+            if self.range.currentData() is not None or live:
+                right = max(right, now)
+        for tag in lanes:
+            if not isinstance(texts[tag], TextSeries):
+                texts[tag] = TextSeries.from_spans(texts[tag], left)
+        data["__text__"] = texts
+
+        config = self.session.cfg.as_dict()
+        pens = []
+        maths = data.get("__math__", {})
+        for tag in present:
+            prefs = trendprefs.pen(config, tag)
+            series = data[tag]
+            lane = prefs["draw"] == "lane" or (prefs["draw"] == "auto" and series.is_boolean())
+            rules = trendprefs.rules(prefs)
+            pens.append({"tag": tag, "series": series, "colour": self._colour_for(tag),
+                         "lane": lane, "scale": prefs["scale"], "units": prefs["units"],
+                         "description": prefs["description"], "rules": rules,
+                         "flags": trendmath.flags(series, rules, right) if rules else [],
+                         "math": trendmath.describe_math(maths[tag]) if tag in maths else "",
+                         "kind": "number"})
+        strips = [(tag, texts[tag], self._colour_for(tag)) for tag in lanes]
+        self.empty_label.setVisible(False)
+        self.chart.setVisible(True)
+        self.chart.build(pens, strips, self.arrange.value(), left, right, events=events)
+        for lane in self.chart.lanes:
+            lane["kind"] = "text"
+            lane["description"] = trendprefs.pen(config, lane["tag"])["description"]
+        self.pen_table.show_pens(self.chart.lines + self.chart.lanes)
+        self.values_panel.setVisible(True)
+        if self.cursor_btn.isChecked() and self.chart.cursors is None:
+            self.chart.set_cursors(True)
+        self._lines, self._lanes = self.chart.lines, self.chart.lanes
+        robots = set(data.get("__robots__", []))
+        for line in self._lines:
+            line["robot"] = line["tag"] in robots
+        self._last = (data, tags, label)
+        self._sources = {k: v for k, v in data.items() if isinstance(v, StepSeries)
+                         and k not in maths and k not in robots}
+        self._dirty = False
+        if self.cycle_view is not None:
+            self.cycle_view.set_sources(self._lines, self._lanes, self.chart.right_edge)
+        if self._compare is not None:
+            self._load_compare()
+        self._live_robots = [s for s in data.get("__signals__", []) if s.name in present]
+        self._robot_db = data.get("__db__") or ""
+        self._problem = problems[0] if problems else ""
+        if previous_view:
+            self.chart.show_range(*previous_view)
+        if held:
+            self._apply_rows(held)
+        if self.live.isChecked():
+            self._follow(True)
+        self._find_changed()
+        self._update_status()
+        self._cursors_moved()
+        self._update_stats()        # now, not on the timer: no flash of empty cells
+
+    def _rerender(self) -> None:
+        """Draw the last data again -- another arrangement, another theme --
+        without reading the file again, and keep the time in view."""
+        if self._last is not None and not self._loading:
+            self._render(*self._last, keep_view=True)
+
+    def _update_status(self) -> None:
+        if self.chart is None or not (self._lines or self._lanes) or self._loading:
             return
-        stacked = self.arrange.value() == "stacked" and len(present) > 1
-        charts = (len(present) if stacked else 1) if present else 0
-        # Number charts get three parts of the height each, text strips one.
-        ratios = [3] * charts + [1] * len(lanes)
-        self.figure.clear()
-        grid = self.figure.add_gridspec(len(ratios), 1, height_ratios=ratios,
-                                        hspace=0.12 if (stacked or lanes) else 0.2)
-        first = None
-        chart_axes = []
-        for i in range(charts):
-            ax = self.figure.add_subplot(grid[i, 0], sharex=first)
-            first = first or ax
-            chart_axes.append(ax)
-        lane_axes = []
-        for j in range(len(lanes)):
-            ax = self.figure.add_subplot(grid[charts + j, 0], sharex=first)
-            first = first or ax
-            lane_axes.append(ax)
-        axes_for_lines = chart_axes if stacked else [chart_axes[0]] * len(present) if present else []
-        self._axes = chart_axes + lane_axes
-        self.axes = self._axes[0]
-        points = 0
-        for tag, ax in zip(present, axes_for_lines):
-            times, values = data[tag]
-            ax.plot(times, values, label=tag, color=self._colour_for(tag), linewidth=2,
-                    solid_joinstyle="round", solid_capstyle="round")
-            self._lines.append((tag, times, values, ax))
-            points += len(times)
-        for ax in chart_axes:
-            self._style(ax)
-            ax.yaxis.set_major_locator(MaxNLocator(nbins=4 if stacked else 8))
-            # Plain numbers on the axis: a vehicle number is 3206300, not
-            # 3.2 with "1e6" in the corner.
-            try:
-                ax.ticklabel_format(axis="y", style="plain", useOffset=False)
-            except AttributeError:
-                pass
-        # The strips need an end time for the last span: the end of the range
-        # asked for, or the latest time anything here was seen.
-        latest = [times[-1] for _tag, times, _values, _ax in self._lines]
-        latest += [spans[-1][0] for spans in texts.values() if spans]
-        _start_ms, end_ms, _label = self._window()
-        right = datetime.fromtimestamp(end_ms / 1000) if end_ms else max(latest)
-        if end_ms is None and self.range.currentData() is not None:
-            right = max(right, datetime.now())
-        earliest = [times[0] for _tag, times, _values, _ax in self._lines]
-        earliest += [spans[0][0] for spans in texts.values() if spans]
-        left = min(earliest)
-        for tag, ax in zip(lanes, lane_axes):
-            self._draw_lane(ax, tag, texts[tag], left, right)
-            points += len(texts[tag])
-        locator = mdates.AutoDateLocator()
-        bottom = self._axes[-1]
-        for ax in self._axes[:-1]:
-            ax.tick_params(labelbottom=False)
-        bottom.xaxis.set_major_locator(locator)
-        bottom.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-        if stacked:
-            # Each chart names its tag in its own corner, in ink rather than
-            # the line colour; the line beside the name carries identity.
-            for tag, _times, _values, ax in self._lines:
-                ax.text(0.005, 0.96, tag, transform=ax.transAxes, ha="left", va="top",
-                        fontsize=8.5, color=t["txt_1"],
-                        bbox=dict(boxstyle="round,pad=0.25", fc=t["bg_2"], ec="none", alpha=0.85))
-        elif len(self._lines) >= 2:
-            legend = self.axes.legend(loc="upper left", fontsize=8, frameon=True,
-                                      ncols=min(4, len(self._lines)))
-            legend.get_frame().set_facecolor(t["bg_1"])
-            legend.get_frame().set_edgecolor(t["line_soft"])
-            for text in legend.get_texts():
-                text.set_color(t["txt_1"])
-        elif self._lines:
-            self.axes.set_title(self._lines[0][0], color=t["txt_1"], fontsize=10, loc="left")
-        titled = bool(self._lines) and not stacked and len(self._lines) == 1
-        self.figure.subplots_adjust(left=0.08, right=0.98, top=0.93 if titled else 0.97,
-                                    bottom=0.1)
-        bottom.callbacks.connect("xlim_changed", lambda _ax: self._label_lanes())
-        self._label_lanes()
-        self._tip = None
-        self._find_changed(redraw=False)
-        self.canvas.draw_idle()
+        if self.finder.text().strip() and self._match_at < 0:
+            return      # Find's count is showing
         n = len(self._lines) + len(self._lanes)
-        self.chart_status.setText(f"{n} tag{'s' if n != 1 else ''}, {points:,} points, {label}"
-                                  f"  |  updated {time.strftime('%H:%M:%S')}"
-                                  + ("  |  " + problems[0] if problems else ""))
+        changes = sum(len(line["series"]) for line in self._lines) + \
+            sum(len(lane["series"]) for lane in self._lanes)
+        label = self._last[2] if self._last else ""
+        if self.live.isChecked():
+            state = ("live, following now" if self._following else
+                     "live, scrolling paused (Home follows again)")
+        else:
+            state = f"{label}  |  updated {time.strftime('%H:%M:%S')}"
+        text = f"{n} tag{'s' if n != 1 else ''}, {changes:,} changes, {state}"
+        if self.chart.events is not None:
+            text += f"  |  {self.chart.events.count():,} events"
+        if self.chart.ghost_label:
+            text += f"  |  compared with {self.chart.ghost_label}"
+        if getattr(self, "_problem", ""):
+            text += "  |  " + self._problem
+        self.chart_status.setText(text)
 
-    # ------------------------------------------------------- text strips
+    # -------------------------------------------------------------- live
 
-    def _draw_lane(self, ax, tag: str, spans: list, left, right) -> None:
-        """A text tag as a strip: a bar per value, from when it was taken to
-        when the next one was. Values alternate between two strengths of the
-        tag's colour so neighbours with no gap stay apart; an empty value
-        (a register cleared between messages) is left blank."""
-        import matplotlib.dates as mdates
-        t = sheet.tokens()
-        colour = self._colour_for(tag)
-        segments = []
-        for i, (when, value) in enumerate(spans):
-            begin = when
-            if i == 0 and len(spans) > 1 and spans[1][0] == when:
-                begin = left            # the value before the first change
-            finish = spans[i + 1][0] if i + 1 < len(spans) else max(right, when)
-            # Two changes in the same millisecond leave a span of no width:
-            # nothing to draw, and never one stretched to the end of the day.
-            if finish > begin:
-                segments.append((begin, finish, value))
-        x0 = mdates.date2num([b for b, _f, _v in segments])
-        widths = mdates.date2num([f for _b, f, _v in segments]) - x0
-        shades = [0.0 if not v else (0.55 if k % 2 else 0.85) for k, (_b, _f, v) in
-                  enumerate(segments)]
-        bars = ax.barh([0] * len(segments), widths, left=x0, height=0.8, color=colour,
-                       edgecolor=t["bg_2"], linewidth=0.6)
-        for bar, alpha in zip(bars, shades):
-            bar.set_alpha(alpha)
-        ax.set_ylim(-0.5, 0.5)
-        ax.set_yticks([])
-        ax.set_facecolor(t["bg_2"])
-        for side, spine in ax.spines.items():
-            spine.set_visible(side == "bottom")
-            spine.set_color(t["line"])
-        ax.tick_params(colors=t["txt_2"], labelsize=8, length=3)
-        ax.text(0.005, 0.5, tag, transform=ax.transAxes, ha="left", va="center",
-                fontsize=8.5, color=t["txt_1"], zorder=5,
-                bbox=dict(boxstyle="round,pad=0.25", fc=t["bg_2"], ec="none", alpha=0.9))
-        self._lanes.append({"tag": tag, "ax": ax, "segments": segments, "labels": []})
+    def _live_toggled(self, on: bool) -> None:
+        if on:
+            if self.source.currentIndex() != 0:
+                self.source.setCurrentIndex(0)
+            if self.range.currentData() == -1:
+                # A fixed "between" has an end; following now needs a window.
+                self.range.setCurrentIndex(self.range.findData(5))
+            self._following = True
+            self._timer.start()
+            self.plot()
+        else:
+            self._timer.stop()
+            self._update_status()
 
-    def _label_lanes(self) -> None:
-        """Write each value in its span where the span is wide enough, at
-        the current zoom. Called again whenever the time axis moves."""
-        if self.figure is None or not self._lanes:
+    def _live_rows(self, rows: list) -> None:
+        """Rows the monitor has just logged (Session.events)."""
+        if not self.live.isChecked() or self.source.currentIndex() != 0:
             return
-        import matplotlib.dates as mdates
-        t = sheet.tokens()
-        for lane in self._lanes:
-            for text in lane["labels"]:
-                text.remove()
-            lane["labels"] = []
-            ax = lane["ax"]
-            lo, hi = ax.get_xlim()
-            px_per_day = ax.bbox.width / max(hi - lo, 1e-12)
-            drawn = 0
-            for begin, finish, value in lane["segments"]:
-                if not value:
+        if self._loading:
+            self._held.extend(rows)     # applied once the history is drawn
+            return
+        self._apply_rows(rows)
+
+    def _apply_rows(self, rows: list) -> None:
+        if self.chart is None:
+            return
+        lines = self._sources
+        lanes = {lane["tag"]: lane["series"] for lane in self._lanes}
+        events = self.chart.events is not None and self.show_events.isChecked()
+        if not lines and not lanes and not events:
+            return
+        for row in rows:
+            if row.get("event_type") != logdata.PLC_CHANGED:
+                if events and trendmath.is_event_row(row):
+                    self.chart.add_event(trendmath.event_of(row))
+                continue
+            tag = (row.get("tag_or_addr") or "").strip()
+            if tag not in lines and tag not in lanes:
+                continue
+            ms = logdata.row_ms(row)
+            if ms is None:
+                continue
+            new = str(row.get("new_value") or "").strip()
+            if tag in lines:
+                number = logdata.number(new)
+                if number is None and new:
                     continue
-                b, f = mdates.date2num(begin), mdates.date2num(finish)
-                if f < lo or b > hi:
-                    continue
-                if (min(f, hi) - max(b, lo)) * px_per_day < LABEL_MIN_PX:
-                    continue
-                lane["labels"].append(ax.text(
-                    (max(b, lo) + min(f, hi)) / 2, 0, value, ha="center", va="center",
-                    fontsize=8, color=t["txt_0"], clip_on=True))
-                drawn += 1
-                if drawn >= 400:
-                    break
-        self.canvas.draw_idle()
+                if lines[tag].append(ms / 1000, math.nan if number is None else number):
+                    self._dirty = True
+            else:
+                lanes[tag].append(ms / 1000, new)
+
+    def _tick(self) -> None:
+        """Live: move the right edge to now, scroll if following, redraw."""
+        if self.chart is None or not (self._lines or self._lanes) or self._loading:
+            return
+        now = time.time()
+        self.chart.right_edge = now
+        self._ticks += 1
+        if self._following:
+            self._follow(False)
+        else:
+            self.chart.refresh()
+        if self._live_robots and self._ticks % ROBOT_EVERY_TICKS == 0:
+            self._read_robots_since()
+        if self._ticks % 4 == 0:
+            self._live_recompute()
+            self._update_status()
+            self._update_values()
+
+    def _window_seconds(self) -> float:
+        minutes = self.range.currentData()
+        if minutes not in (None, -1):
+            return minutes * 60
+        span = self.chart.view_range() if self.chart is not None else None
+        return (span[1] - span[0]) if span else 300.0
+
+    def _follow(self, resume: bool) -> None:
+        if resume:
+            self._following = True
+        now = time.time()
+        if self.chart is not None:
+            self.chart.right_edge = max(self.chart.right_edge or now, now)
+            self.chart.show_range(now - self._window_seconds(), now)
+
+    def _moved(self) -> None:
+        if self.live.isChecked() and self._following:
+            self._following = False
+            self._update_status()
+
+    def _read_robots_since(self) -> None:
+        """Live robots: RobControl's samples since the newest one drawn, read
+        on a worker thread (the database is RobControl's, opened read-only)."""
+        if self._robots_busy or not self._robot_db:
+            return
+        series = {line["tag"]: line["series"] for line in self._lines if line.get("robot")}
+        signals = [s for s in self._live_robots if s.name in series]
+        if not signals:
+            return
+        since = min(int((series[s.name].last_time or 0) * 1000) for s in signals)
+        db = self._robot_db
+        self._robots_busy = True
+
+        def work():
+            try:
+                found = robdata.series(db, signals, since)
+            except robdata.RobDataError:
+                found = {}
+            self._robots_more.emit(found)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _robot_samples(self, found: dict) -> None:
+        self._robots_busy = False
+        series = {line["tag"]: line["series"] for line in self._lines if line.get("robot")}
+        for name, (times, values) in found.items():
+            if name in series:
+                for when, value in zip(times, values):
+                    series[name].append(when.timestamp(), value)
 
     # -------------------------------------------------------------- find
 
     def _find_changed(self, redraw: bool = True) -> None:
         """Every change to a value containing the find text, as (time, tag,
         value), marked with a thin line across all the charts."""
-        import matplotlib.dates as mdates
-        for mark in self._marks:
-            try:
-                mark.remove()
-            except (ValueError, AttributeError):
-                pass
-        self._marks = []
         self._matches = []
         self._match_at = -1
         needle = self.finder.text().strip().lower()
-        if needle and self.figure is not None:
+        if needle and self.chart is not None:
+            right = self.chart.right_edge
             for lane in self._lanes:
-                for begin, _finish, value in lane["segments"]:
+                for begin, _end, value in lane["series"].segments(right):
                     if value and needle in value.lower():
                         self._matches.append((begin, lane["tag"], value))
-            for tag, times, values, _ax in self._lines:
-                previous = None
-                for when, value in zip(times, values):
-                    if value != value:          # NaN: a gap, no value
-                        continue
-                    # Whole numbers in full: a vehicle number 3206300, not
-                    # %g's 3.2063e+06.
-                    text = str(int(value)) if float(value).is_integer() else f"{value:g}"
-                    if text != previous and needle == text.lower():
-                        self._matches.append((when, tag, text))
-                    previous = text
+            for line in self._lines:
+                for when, text in trendview.number_matches(line["series"], needle):
+                    self._matches.append((when, line["tag"], text))
             self._matches.sort(key=lambda m: m[0])
-            t = sheet.tokens()
-            for when, _tag, _value in self._matches[:2000]:
-                x = mdates.date2num(when)
-                for ax in self._axes:
-                    self._marks.append(ax.axvline(x, color=t["accent"], linewidth=1,
-                                                  alpha=0.55, zorder=4))
+        if self.chart is not None:
+            self.chart.set_marks([m[0] for m in self._matches[:MAX_MARKS]])
         if needle:
             n = len(self._matches)
             self.chart_status.setText(f"{n:,} match{'es' if n != 1 else ''} for '{needle}'"
                                       if n else f"No value contains '{needle}' in this chart.")
+        else:
+            self._update_status()
         self.find_prev.setEnabled(bool(self._matches))
         self.find_next.setEnabled(bool(self._matches))
         self.find_log.setEnabled(False)
-        if redraw and self.figure is not None:
-            self.canvas.draw_idle()
 
     def _step(self, direction: int) -> None:
         """To the next (or previous) match: centred, at the current zoom if
         that already shows some detail, else zoomed to show its neighbours."""
-        if not self._matches or self.figure is None:
+        if not self._matches or self.chart is None:
             return
-        import matplotlib.dates as mdates
         self._match_at = (self._match_at + direction) % len(self._matches)
-        when, tag, value = self._matches[self._match_at]
-        x = mdates.date2num(when)
-        ax = self._axes[-1]
-        lo, hi = ax.get_xlim()
+        x, tag, value = self._matches[self._match_at]
+        lo, hi = self.chart.view_range() or (x - 60, x + 60)
         width = hi - lo
-        full = [mdates.date2num(m[0]) for m in self._matches]
+        full = [m[0] for m in self._matches]
         span = (max(full) - min(full)) if len(full) > 1 else width
-        if width > max(span / 10, 1 / 1440):
-            width = max(span / 10, 2 / 1440)       # at least two minutes
-        ax.set_xlim(x - width / 2, x + width / 2)
-        # Relabel the strips for the new zoom. (The xlim_changed callback
-        # does this for the toolbar's pan and zoom, but was not reliably
-        # called for a limit set from code on a shared axis.)
-        self._label_lanes()
+        if width > max(span / 10, 60):
+            width = max(span / 10, 120)            # at least two minutes
+        if self.live.isChecked():
+            self._following = False
+        self.chart.show_range(x - width / 2, x + width / 2)
         self.find_log.setEnabled(True)
+        when = datetime.fromtimestamp(x)
         self.chart_status.setText(f"{self._match_at + 1:,} of {len(self._matches):,}: {tag} = "
                                   f"{value} at {when:%Y-%m-%d %H:%M:%S}.{when.microsecond // 1000:03d}")
-        self.canvas.draw_idle()
-
-    def _hover(self, event) -> None:
-        """Nearest point under the pointer, as a small label: tag, time, value."""
-        axes = getattr(self, "_axes", [])
-        if self.figure is None or not (self._lines or self._lanes) or event.inaxes not in axes:
-            if getattr(self, "_tip", None) is not None and self._tip.get_visible():
-                self._tip.set_visible(False)
-                self.canvas.draw_idle()
-            return
-        import matplotlib.dates as mdates
-        lane = next((ln for ln in self._lanes if ln["ax"] is event.inaxes), None)
-        if lane is not None:
-            self._hover_lane(lane, event)
-            return
-        best = None
-        for tag, times, values, ax in self._lines:
-            if ax is not event.inaxes:
-                continue
-            xs = mdates.date2num(times)
-            for x, y, when in zip(xs, values, times):
-                if y != y:      # NaN: a gap in the line
-                    continue
-                px, py = ax.transData.transform((x, y))
-                d = (px - event.x) ** 2 + (py - event.y) ** 2
-                if best is None or d < best[0]:
-                    best = (d, tag, when, y, x, ax)
-        if best is None or best[0] > 30 ** 2:
-            if self._tip is not None and self._tip.get_visible():
-                self._tip.set_visible(False)
-                self.canvas.draw_idle()
-            return
-        _, tag, when, value, x, ax = best
-        t = sheet.tokens()
-        text = f"{tag}\n{when.strftime('%H:%M:%S.%f')[:-3]}   {value:g}"
-        if self._tip is not None and self._tip.axes is not ax:
-            self._tip.remove()
-            self._tip = None
-        if self._tip is None:
-            self._tip = ax.annotate(
-                text, xy=(x, value), xytext=(12, 12), textcoords="offset points", fontsize=8,
-                color=t["txt_0"], bbox=dict(boxstyle="round,pad=0.4", fc=t["bg_1"], ec=t["line"]))
-        else:
-            self._tip.xy = (x, value)
-            self._tip.set_text(text)
-            self._tip.set_visible(True)
-        self.canvas.draw_idle()
 
     def _show_in_log(self) -> None:
         if not (0 <= self._match_at < len(self._matches)):
             return
-        when, tag, value = self._matches[self._match_at]
-        self.session.showInLog.emit(self.source.currentData() or "",
-                                    int(when.timestamp() * 1000), tag, str(value))
-
-    def _hover_lane(self, lane: dict, event) -> None:
-        """Over a text strip: the value under the pointer and when it began."""
-        import matplotlib.dates as mdates
-        x = event.xdata
-        hit = None
-        for begin, finish, value in lane["segments"]:
-            if mdates.date2num(begin) <= x <= mdates.date2num(finish):
-                hit = (begin, finish, value)
-                break
-        ax = lane["ax"]
-        if hit is None or not hit[2]:
-            if self._tip is not None and self._tip.get_visible():
-                self._tip.set_visible(False)
-                self.canvas.draw_idle()
-            return
-        begin, finish, value = hit
-        t = sheet.tokens()
-        stamp = lambda d: f"{d:%H:%M:%S}.{d.microsecond // 1000:03d}"  # noqa: E731
-        text = f"{lane['tag']}\n{value}\n{stamp(begin)} to {stamp(finish)}"
-        if self._tip is not None and self._tip.axes is not ax:
-            self._tip.remove()
-            self._tip = None
-        if self._tip is None:
-            self._tip = ax.annotate(
-                text, xy=(x, 0), xytext=(12, 10), textcoords="offset points", fontsize=8,
-                color=t["txt_0"], zorder=6,
-                bbox=dict(boxstyle="round,pad=0.4", fc=t["bg_1"], ec=t["line"]))
-        else:
-            self._tip.xy = (x, 0)
-            self._tip.set_text(text)
-            self._tip.set_visible(True)
-        self.canvas.draw_idle()
+        x, tag, value = self._matches[self._match_at]
+        self.session.showInLog.emit(self.source.currentData() or "", int(round(x * 1000)),
+                                    tag, str(value))
 
     def _nav(self, what: str) -> None:
-        if self.figure is None:
+        if self.chart is None:
             return
         if what == "home":
-            self.toolbar.home()
+            if self.live.isChecked():
+                self._follow(True)
+                self._update_status()
+            else:
+                self.chart.home()
             return
-        getattr(self.toolbar, what)()
-        mode = str(getattr(self.toolbar, "mode", "")).lower()
-        self.pan_btn.setChecked("pan" in mode)
-        self.zoom_btn.setChecked("zoom" in mode)
+        if what in ("back", "forward"):
+            if self.live.isChecked():
+                self._following = False
+            getattr(self.chart, what)()
+            self._update_status()
+            return
+        if what == "zoom" and not self.zoom_btn.isChecked():
+            what = "pan"
+        self.pan_btn.setChecked(what == "pan")
+        self.zoom_btn.setChecked(what == "zoom")
+        self.chart.set_mode(what)
 
     def _export(self) -> None:
-        if self.figure is None:
+        if self.chart is None or not (self._lines or self._lanes):
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export chart", "plc_trend.png", "PNG image (*.png)")
         if path:
-            self.figure.savefig(path, dpi=150, facecolor=self.figure.get_facecolor())
+            self.chart.export_png(path)
             self.session.status.emit(f"Saved {path}")
+
+    def _live_recompute(self) -> None:
+        """Live, once a second: math pens and flags again from what came in."""
+        if not self._dirty or self.chart is None or self._last is None:
+            return
+        self._dirty = False
+        maths = self._last[0].get("__math__", {})
+        right = self.chart.right_edge
+        for line in self._lines:
+            if line["tag"] in maths:
+                computed = trendmath.compute_math(maths[line["tag"]], self._sources)
+                if computed is not None:
+                    line["series"] = computed
+                    self._last[0][line["tag"]] = computed
+            if line.get("rules"):
+                self.chart.set_flags(line, trendmath.flags(line["series"], line["rules"], right))
+        self._stats_timer.start()
+
+    # ------------------------------------------------------------- events
+
+    def _pairs_note(self) -> None:
+        spec = self.session.latency_spec
+        if spec is None:
+            self.pairs_note.setText("Measure on the Latency page first.")
+            self.show_pairs.setToolTip("Trend draws the pairs the Latency page last measured: "
+                                       "a bar from each trigger to its response.")
+        else:
+            self.pairs_note.setText("")
+            self.show_pairs.setToolTip(f"From the Latency page: {spec['label']}. A bar from "
+                                       "each trigger to its response; a red mark where none came.")
+        self.pairs_note.setVisible(spec is None)
+        self.show_pairs.setEnabled(spec is not None)
+
+    def _event_clicked(self, event) -> None:
+        self.session.showInLog.emit(self.source.currentData() or "", int(round(event.t * 1000)),
+                                    event.tag, "")
+
+    # ------------------------------------------------------------ flags
+
+    def _next_flag(self, tag: str) -> None:
+        line = next((ln for ln in self._lines if ln["tag"] == tag), None)
+        if line is None or not line.get("flags") or self.chart is None:
+            return
+        lo, hi = self.chart.view_range()
+        centre = (lo + hi) / 2
+        flags = line["flags"]
+        after = [f for f in flags if f.start > centre + 1e-6]
+        flag = after[0] if after else flags[0]
+        width = max(hi - lo, (flag.end - flag.start) * 3, 1.0)
+        mid = (flag.start + flag.end) / 2
+        if self.live.isChecked():
+            self._following = False
+        self.chart.show_range(mid - width / 2, mid + width / 2)
+        n = flags.index(flag) + 1
+        when = datetime.fromtimestamp(flag.start)
+        self.chart_status.setText(f"{tag}: flag {n:,} of {len(flags):,} at {when:%Y-%m-%d %H:%M:%S}"
+                                  f" -- {flag.text}")
+
+    # ------------------------------------------------------------- math
+
+    def _add_math_items(self, ticked: set) -> None:
+        for name, spec in trendprefs.math_pens(self.session.cfg.as_dict()).items():
+            item = QListWidgetItem(f"{name}   math")
+            item.setData(TAG_ROLE, name)
+            item.setData(KIND_ROLE, "math")
+            item.setToolTip(f"Math pen: {trendmath.describe_math(spec)}. Double-click to "
+                            "change or delete it.")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in ticked else Qt.Unchecked)
+            self.tag_list.addItem(item)
+
+    def _math_sources(self) -> list[str]:
+        kinds = self._kinds()
+        return sorted((t for t, k in kinds.items() if k == "number"), key=str.lower)
+
+    def _new_math(self) -> None:
+        self._math_dialog("", None)
+
+    def _tag_double_clicked(self, item) -> None:
+        if item.data(KIND_ROLE) == "math":
+            name = item.data(TAG_ROLE)
+            self._math_dialog(name, trendprefs.math_pens(self.session.cfg.as_dict()).get(name))
+
+    def _math_dialog(self, name: str, spec: dict | None) -> None:
+        dialog = MathDialog(self._math_sources(), name=name, spec=spec, parent=self)
+        if not dialog.exec():
+            return
+        config = self.session.cfg.as_dict()
+        ticked = set(self._selected())
+        if name:
+            trendprefs.delete_math(config, name)
+        if not dialog.deleted:
+            try:
+                new = trendprefs.save_math(config, dialog.result_name(), dialog.spec())
+            except ValueError as exc:
+                w.error(self, "Math pen", str(exc))
+                return
+            ticked.discard(name)
+            ticked.add(new)
+        self.session.save_config()
+        # Rebuild the math entries in the list, keeping the ticks.
+        self.tag_list.blockSignals(True)
+        for i in reversed(range(self.tag_list.count())):
+            if self.tag_list.item(i).data(KIND_ROLE) == "math":
+                self.tag_list.takeItem(i)
+        self._add_math_items(ticked)
+        self.tag_list.blockSignals(False)
+        self._ticked()
+        if self._lines or self._lanes:
+            self.plot()
+
+    # ---------------------------------------------------------- compare
+
+    def _compare_dialog(self) -> None:
+        if self.chart is None or not self._lines:
+            w.info(self, "Compare", "Plot some tags first; Compare draws the same tags from "
+                                    "another time beside them.")
+            return
+        sources = [(self.source.itemText(i), self.source.itemData(i))
+                   for i in range(self.source.count())]
+        dialog = CompareDialog(sources, self.source.currentData(), self.chart.extent[0],
+                               comparing=self._compare is not None, parent=self)
+        if not dialog.exec():
+            return
+        if dialog.stopped:
+            self._compare = None
+            self.chart.set_ghosts({})
+            self.compare_btn.setText("Compare")
+            self._update_status()
+            return
+        self._compare = dialog.choice()
+        self._load_compare()
+
+    def _load_compare(self) -> None:
+        """Read the comparison's tags on a worker thread, shifted onto this
+        chart's time axis."""
+        if self._compare is None or self.chart is None or self.chart.extent is None:
+            return
+        path, offset, label = self._compare
+        x0, x1 = self.chart.extent
+        maths = self._last[0].get("__math__", {}) if self._last else {}
+        tags = [line["tag"] for line in self._lines
+                if not line.get("robot") and line["tag"] not in maths]
+        for spec in maths.values():
+            for source in (spec["a"], spec["b"]):
+                if source and source not in tags:
+                    tags.append(source)
+        specs = self.session.group_specs()
+        self.chart_status.setText(f"Reading {label} to compare...")
+
+        def work():
+            ghosts = {}
+            try:
+                wanted = set(tags)
+                rows = [r for r in self.session.log_rows(path, specs)
+                        if r.get("event_type") == "PLC_CHANGED"
+                        and (r.get("tag_or_addr") or "").strip() in wanted]
+                found = logdata.series(rows, tags, int((x0 - offset) * 1000),
+                                       int((x1 - offset) * 1000))
+                for tag, (times, values) in found.items():
+                    if times:
+                        ghosts[tag] = StepSeries([t.timestamp() + offset for t in times], values)
+                for name, spec in maths.items():
+                    computed = trendmath.compute_math(spec, ghosts)
+                    if computed is not None:
+                        ghosts[name] = computed
+            except OSError as exc:
+                ghosts = {"__error__": str(exc)}
+            self._compared.emit(ghosts, label)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_compare(self, ghosts: dict, label: str) -> None:
+        if self.chart is None or self._compare is None:
+            return
+        if "__error__" in ghosts:
+            self.chart_status.setText(f"Could not read the log to compare: {ghosts['__error__']}")
+            return
+        self.chart.set_ghosts(ghosts, label)
+        self.compare_btn.setText("Comparing")
+        shown = sum(1 for line in self._lines if line["tag"] in ghosts)
+        self._update_status()
+        if not shown:
+            self.chart_status.setText(f"Nothing for these tags {label}.")
+
+    # ----------------------------------------------------------- cycles
+
+    def _view_changed(self, key: str) -> None:
+        cycles = key == "cycles"
+        self.views.setCurrentIndex(1 if cycles and self.cycle_view is not None else 0)
+        for widget in self._time_tools:
+            widget.setVisible(not cycles)
+        if cycles and self.cycle_view is not None and self.chart is not None:
+            self.cycle_view.set_sources(self._lines, self._lanes, self.chart.right_edge)
+
+    def _jump_to_cycle(self, trigger: float, before: float, after: float) -> None:
+        self.view.set_value("time")
+        self._view_changed("time")
+        if self.chart is None:
+            return
+        if self.live.isChecked():
+            self._following = False
+        pad = (before + after) * 0.1
+        self.chart.show_range(trigger - before - pad, trigger + after + pad)
+        if self.chart.cursors is not None:
+            self.chart.place_cursor("A", trigger, snap=False)
+        when = datetime.fromtimestamp(trigger)
+        self.chart_status.setText(f"Cycle starting {when:%Y-%m-%d %H:%M:%S}."
+                                  f"{when.microsecond // 1000:03d}")
+
+    # ------------------------------------------------------- value bar
+
+    def _hovered(self, x) -> None:
+        self._pointer = x
+        self._update_values()
+
+    def _history(self, can_back: bool, can_forward: bool) -> None:
+        self.view_back.setEnabled(can_back)
+        self.view_forward.setEnabled(can_forward)
+
+    def _cursors_toggled(self, on: bool) -> None:
+        if self.chart is None:
+            return
+        self.chart.set_cursors(on and bool(self._lines or self._lanes))
+        self.pen_table.set_cursors(on)
+        self._cursors_moved()
+
+    def _cursors_moved(self) -> None:
+        cursors = self.chart.cursors if self.chart is not None else None
+        if cursors:
+            a, b = cursors["A"], cursors["B"]
+            self.cursor_info.setText(
+                f"A  {stamp(a)}     B  {stamp(b)}     B - A  {duration(b - a)}"
+                "     (min, max, average and changes between A and B)")
+        else:
+            self.cursor_info.setText("Min, max, average and changes are for what is in view. "
+                                     "Cursors measures between two moments.")
+        self._update_values()
+        self._stats_timer.start()
+
+    def _update_values(self) -> None:
+        if self.chart is None or not self.pen_table.pens:
+            return
+        self.pen_table.update_values(self._pointer, self.chart.right_edge, self.chart.cursors,
+                                     self.chart.right_edge)
+
+    def _update_stats(self) -> None:
+        if self.chart is None or not self.pen_table.pens:
+            return
+        cursors = self.chart.cursors
+        if cursors:
+            x0, x1 = cursors["A"], cursors["B"]
+        else:
+            span = self.chart.view_range()
+            if span is None:
+                return
+            x0, x1 = span
+        self.pen_table.update_stats(x0, x1, self.chart.right_edge)
+
+    def _edit_pen(self, tag: str) -> None:
+        config = self.session.cfg.as_dict()
+        pen = next((p for p in self.pen_table.pens if p["tag"] == tag), None)
+        if pen is None:
+            return
+        text = pen["kind"] == "text"
+        boolean = not text and pen["series"].is_boolean()
+        dialog = PenDialog(tag, trendprefs.pen(config, tag), text=text, boolean=boolean,
+                           parent=self)
+        if dialog.exec():
+            trendprefs.set_pen(config, tag, dialog.values())
+            self.session.save_config()
+            self._rerender()
+
+    # ---------------------------------------------------------- layouts
+
+    def _fill_layouts_menu(self) -> None:
+        menu = self.layouts_menu
+        menu.clear()
+        saved = trendprefs.layouts(self.session.cfg.as_dict())
+        if saved:
+            for name in saved:
+                menu.addAction(name, lambda n=name: self.load_layout(n))
+            menu.addSeparator()
+        else:
+            empty = menu.addAction("No layouts saved in this profile yet")
+            empty.setEnabled(False)
+        menu.addAction("Save current as...", self._save_layout)
+        if saved:
+            delete = menu.addMenu("Delete")
+            for name in saved:
+                delete.addAction(name, lambda n=name: self._delete_layout(n))
+
+    def current_layout(self) -> dict:
+        minutes = self.range.currentData()
+        return {"tags": self._selected(), "robots": [s.name for s in self._selected_robots()],
+                "arrange": self.arrange.value(),
+                "range": None if minutes == -1 else minutes,
+                "cursors": self.cursor_btn.isChecked(),
+                "events": self.show_events.isChecked(), "pairs": self.show_pairs.isChecked()}
+
+    def _save_layout(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save layout", "Name for this set of tags:")
+        name = " ".join(name.split())
+        if not ok or not name:
+            return
+        config = self.session.cfg.as_dict()
+        if name in trendprefs.layouts(config) and not w.ask(
+                self, "Save layout", f"Replace the layout '{name}'?", yes="Replace"):
+            return
+        trendprefs.save_layout(config, name, self.current_layout())
+        if self.session.save_config():
+            self.session.status.emit(f"Saved the trend layout '{name}' in this profile.")
+
+    def _delete_layout(self, name: str) -> None:
+        if not w.ask(self, "Delete layout", f"Delete the layout '{name}'?", yes="Delete"):
+            return
+        if trendprefs.delete_layout(self.session.cfg.as_dict(), name):
+            self.session.save_config()
+
+    def load_layout(self, name: str) -> None:
+        """Tick a saved layout's tags and robots, set its arrangement and
+        range, and plot. Tags this log does not have are named, not lost."""
+        layout = trendprefs.layouts(self.session.cfg.as_dict()).get(name)
+        if layout is None:
+            return
+        wanted = set(layout["tags"])
+        self.tag_list.blockSignals(True)
+        found = set()
+        for i in range(self.tag_list.count()):
+            item = self.tag_list.item(i)
+            tag = item.data(TAG_ROLE)
+            item.setCheckState(Qt.Checked if tag in wanted else Qt.Unchecked)
+            if tag in wanted:
+                found.add(tag)
+        self.tag_list.blockSignals(False)
+        robots = set(layout["robots"])
+        self.robot_list.blockSignals(True)
+        for i in range(self.robot_list.count()):
+            item = self.robot_list.item(i)
+            signal = self._signals.get(item.data(Qt.UserRole))
+            on = signal is not None and signal.name in robots
+            item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self.robot_list.blockSignals(False)
+        self._ticked()
+        missing = sorted(wanted - found)
+        if missing:
+            self.tag_note.setText(f"Layout '{name}': not in this log: {', '.join(missing)}.")
+            w.set_prop(self.tag_note, "tone", "warn")
+        self.arrange.set_value(layout["arrange"])
+        index = self.range.findData(layout["range"])
+        if index >= 0:
+            self.range.setCurrentIndex(index)
+        self.cursor_btn.setChecked(layout["cursors"])
+        for box, key in ((self.show_events, "events"), (self.show_pairs, "pairs")):
+            box.blockSignals(True)
+            box.setChecked(layout[key] and box.isEnabled())
+            box.blockSignals(False)
+        self.plot()
+
+    # ----------------------------------------------------------- export
+
+    def _export_csv(self, between_cursors: bool) -> None:
+        if self.chart is None or not (self._lines or self._lanes):
+            return
+        if between_cursors and self.chart.cursors:
+            x0, x1 = sorted((self.chart.cursors["A"], self.chart.cursors["B"]))
+        else:
+            x0, x1 = self.chart.view_range()
+        path, _ = QFileDialog.getSaveFileName(self, "Export data", "plc_trend.csv",
+                                              "CSV (*.csv)")
+        if path:
+            count = self.write_csv(path, x0, x1)
+            self.session.status.emit(f"Saved {count:,} rows to {path}")
+
+    def write_csv(self, path: str, x0: float, x1: float) -> int:
+        """The tags' values from ``x0`` to ``x1``: for each, the value it held
+        at the start, then every change -- the same shape as the log, so it
+        opens in Excel and reads back into anything that reads the log."""
+        numbers = {line["tag"]: line["series"] for line in self._lines}
+        texts = {lane["tag"]: lane["series"] for lane in self._lanes}
+        units = {line["tag"]: line.get("units", "") for line in self._lines}
+        rows = trendview.export_rows(numbers, texts, x0, x1, self.chart.right_edge)
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            out = csv.writer(handle)
+            out.writerow(["timestamp_ms", "timestamp_human", "tag", "value", "units", "note"])
+            for ms, tag, value, note in rows:
+                when = datetime.fromtimestamp(ms / 1000)
+                out.writerow([ms, f"{when:%Y-%m-%d %H:%M:%S}.{ms % 1000:03d}", tag, value,
+                              units.get(tag, ""), note])
+        return len(rows)
 
     def shown(self) -> None:
         if self.source.count() and self.source.itemData(0) != self.session.logger.log_path:
@@ -932,8 +1542,9 @@ class TrendPage(Page):
 
     def theme_changed(self) -> None:
         super().theme_changed()
-        if self.figure is not None:
-            if self._lines or self._lanes:
-                self.plot()
-            else:
-                self._empty("Pick tags on the left and press Plot.")
+        if self.chart is not None:
+            self.chart.apply_theme()
+            if self.cycle_view is not None:
+                self.cycle_view.theme_changed()
+            if self._last is not None:
+                self._rerender()

@@ -318,8 +318,10 @@ keep. **Folder** opens the log folder -- in File Manager when it is installed.
 ### Trend
 
 Tag values over time from the live log, an archive, or any PLC Monitor log
-opened with **Open file...** (a log from another PC works). Booleans plot as 0
-and 1. **Text tags** -- a VIN, a model, a status word; marked *text* in the
+opened with **Open file...** (a log from another PC works). A tag that only
+ever holds 0 and 1 -- a bit, a True/False -- is drawn as a **lane**, like a
+logic analyser: a thin strip, filled while it is on, so a dozen handshake bits
+fit on one screen and their edges line up by eye. **Text tags** -- a VIN, a model, a status word; marked *text* in the
 list -- are drawn as a strip under the charts: one span per value, labelled
 where there is room (zoom in to label more), so you can read which vehicle
 was in the station while a count or a bit changed above it.
@@ -328,10 +330,128 @@ was in the station while a count or a bit changed above it.
 on the strips and on the number charts, with a thin line through all of
 them. The arrows step from one to the next and zoom to it; the Live log
 button beside them opens the same log in **Live log** at that row, with the
-events either side. **One per tag** gives each tag its own chart on a shared time axis,
-so tags with very different ranges stay readable; **Together** puts them on one
-axis. Hover a line for the exact time and value. Up to eight lines; each keeps
-its colour for the session. **Refresh every 30 s** turns it into a live display.
+events either side (the up and down arrows step; the left and right arrows
+beside Home are the view history, below).
+
+The drop-down in the chart's header arranges them: **Chart per tag** gives each
+tag its own chart on a shared time axis, each scaled to its own values, so tags
+with very different ranges stay readable. **Same scale** keeps a chart per tag
+but puts them all on one value scale, so their sizes compare. **One chart**
+draws them together. Up to eight lines; each keeps its colour for the session.
+
+**Reading the chart.** Each value is drawn as a level from the moment it was
+logged until the next change -- the log records changes, so that is what the
+signal really did. Move the pointer over the charts: a line runs through all of
+them at that moment, and a readout gives the date and time to the millisecond
+and the value each line *held* then (on a text strip, the value and when it
+began and ended). When there are more changes in view than pixels across, each
+pixel column is drawn from the lowest to the highest value in it, so a spike of
+a few milliseconds still shows on a day-long chart; zoom in to see it as steps.
+
+**Moving around.** The mouse moves time only; each chart's value axis follows
+what is in view. The wheel zooms in and out around the pointer, a drag moves
+along the time axis, and the magnifier button switches the drag to drawing a
+box to zoom to. **Home** goes back to the whole range. The **left and right
+arrows** beside it step back and forward through the views you have looked at,
+like a browser's -- zoom in on a fault, look around, and step back out to where
+you were. Zooming stops at a few milliseconds either side of a change.
+
+**Cursors.** Press **Cursors** for two cursors, **A** and **B**, across every
+chart, with the time between them shown above the value bar (*B - A 212 ms*).
+Drag either one, or click a chart to move the nearer one there. A cursor
+dropped within a few pixels of a change **snaps** to it -- the change of any
+line or strip, on any chart -- so the time from a PLC bit rising to a robot
+register changing, or from one VIN to the next, is read exactly rather than by
+eye. Hold **Shift** to place a cursor without snapping.
+
+**The value bar** under the chart has a row per tag: the value at the pointer
+(*Latest* when the pointer is elsewhere); with the cursors on, the value at A,
+at B and the difference; and the lowest, highest and average value and how many
+times it changed -- over what is in view, or between A and B when the cursors
+are on. The average is weighted by time: a value held for an hour counts for an
+hour, not as one row of the log. Drag the handle above the bar to give the chart
+more room.
+
+**A tag's settings.** Double-click a tag in the value bar for its
+**description**, **units** (shown beside its name, on the readout and in the
+export), a **fixed value scale** (say 0 to 1500, so the chart does not rescale
+as you scroll), and whether a 0/1 tag is drawn as a lane or a chart. These are
+saved in the profile, so they travel with it when it is exported to a
+`.plcmon` and are there for anyone who opens it.
+
+**Layouts.** **Layouts** saves the ticked tags and robot signals, the
+arrangement, the range and whether the cursors are on, under a name --
+*Press handshake*, *Oven zone 2* -- in the profile. Pick a layout to tick it
+all again and plot. Tags a layout names that are not in the chosen log are
+listed under the tags rather than silently dropped.
+
+**Export.** *Chart as PNG* saves the picture at twice the screen's
+resolution. *Data in view as CSV* (or *between the cursors*) saves each tag's
+value at the start of the range, then every change in it, with the time to the
+millisecond and the units -- enough to rebuild exactly what the chart showed,
+in Excel or anything else.
+
+**Events.** The **Events** card under the robots adds a strip under the charts
+with the log's other events on the same time axis: **Socket messages** --
+*Received* and *Sent* messages, and *Status* (connections, disconnections and
+errors, errors in red) -- and **Latency pairs**: whatever the **Latency** page
+last measured, drawn as a bar from each trigger to its response, labelled with
+the time where it is wide enough, with a red mark for a trigger that got no
+answer. So *Part_Present rose, the MES answered 212 ms later* sits right under
+the bit that started it. Hover the strip for what each marker is; click one to
+open that row in the **Live log**. Cursors snap to events too. (Pairs are
+worked out when the chart is plotted; plot again to take in new ones.)
+
+**Flags.** In a tag's settings (double-click it in the value bar) give it a
+**high** or **low limit**, a time after which **no change** is suspicious, or,
+for a counter, the largest **step** it should ever take. The chart then points
+them out: time over or under a limit shaded red with the limit as a dashed
+line, a stuck period shaded amber from the moment it went on too long, and a
+mark wherever a counter jumped by more than its step (missed pulses) or went
+backwards. The value bar's **Flags** column counts them in view (hover for the
+list); click the count to go to the next one. In Live they are worked out
+again every second.
+
+**Math pens.** *New math pen...* under the tag list makes a pen worked out from
+others: **A minus B** (or plus, times, divided by) -- the gap between a
+setpoint and the actual, two stations' counts; a counter's **rate** per second
+or minute over a window -- parts per minute from a part count; or **how long
+each state lasted** -- how long *Ready* was high each time, a pulse width, a
+dwell time. It is listed with the tags (marked *math*), ticked like one, and
+drawn, measured, flagged and exported like one; its tags are read even when
+they are not ticked. Double-click it in the list to change or delete it. Math
+pens are saved in the profile.
+
+**Compare.** **Compare** draws the same tags from another time as dashed lines
+in their own colours on this chart: the same time **a day** or **a week
+earlier**, **another log** of the same time (one opened from another PC), or
+**from a moment you choose**, lined up with the chart's left edge. The readout
+gives both values. Robot lines are not compared. **Compare** again to stop.
+
+**Cycles.** **Cycles** (beside **Time** at the top of the chart) lays every
+machine cycle over the others. Choose what starts a cycle -- a tag that
+**rises**, **falls**, **changes**, or **changes to** a value (a text tag: a VIN
+that changes, or changes to one value) -- and a window before and after it, and
+press **Overlay**. Each plotted tag is then drawn once per cycle on a time axis
+counted from the start of the cycle, so a hundred cycles sit on top of each
+other: where they agree the lines pile into one, and a cycle that ran late or
+did something else stands out. The shaded band is the envelope -- where most
+cycles were at each moment (5th to 95th percentile; with fewer than ten
+cycles, lowest to highest) -- with the median dashed. The list beside it ranks
+the cycles by how far they strayed outside the band, worst first; click one to
+pick it out in the accent colour, double-click (or *Show in Time*) to see it on
+the time chart. Untick a known-bad cycle's **Reference** box to leave it out of
+the band. A cycle the log ends in the middle of is listed as *incomplete* and
+left out. An oscilloscope's trigger, but over every cycle in the log at once.
+
+**Live.** Turn on **Live** to follow the PLC: the chart reads the history for
+the range from the live log once, then takes each change as the monitor logs
+it, keeping now at the right edge -- *Last 5 minutes* becomes a five-minute
+window scrolling with the clock. Robot lines are read again every 5 seconds.
+Drag or zoom and the scrolling stops, so the moment you are looking at stays
+put (the line under the chart says so); **Home** follows now again. Live reads
+the live log, so picking an archive turns it off. A tag ticked for Live that
+has not changed yet gets its chart anyway, and fills in at its first change.
 
 **Robots.** When [RobControl](https://github.com/Robbuie/RobControl) (the
 FANUC robot tool from the same family) is installed on this PC and recording,
@@ -487,8 +607,9 @@ slowest real answer? Is the *Stop it at the next* side too narrow (wrong
 answer was logged as Sent)? Try *Direction: Either* and a blank *Containing*
 first, then narrow it down.
 
-**Trend shows a tag as missing.** Only numeric and True/False values plot; a
-tag whose values are text appears in the Live log but not on the Trend page.
+**Trend shows a tag as missing.** The list holds the tags that changed in the
+chosen file; a tag that has never changed since the log began is not in it yet.
+Text values are listed with *text* beside them and drawn as a strip.
 
 ---
 
@@ -516,6 +637,44 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.7.0 -- 2026-11-16
+
+A faster Trend chart, and Live.
+
+- **Trend is drawn with pyqtgraph**: panning and zooming a day of changes is
+  smooth, where the whole chart was redrawn before.
+- **Spikes are never lost**: with more changes in view than pixels, each pixel
+  column is drawn from the lowest to the highest value in it, so a few
+  milliseconds' blip shows on a day-long chart.
+- **Live** follows the PLC: changes go onto the chart as they are logged, with
+  now at the right edge, instead of the file being read again every 30
+  seconds. Dragging or zooming stops the scrolling; Home follows again.
+- **Readout**: the pointer draws a line through every chart and gives the
+  value each tag held at that moment, to the millisecond.
+- The wheel and drags move time only; each value axis fits what is in view.
+- **Cursors A and B** measure between two moments, snapping to the nearest
+  change of any line so the time between two edges is exact (Shift places
+  one freely).
+- **Value bar** under the chart: each tag's value at the pointer, at A and B
+  and the difference, and its min, max, time-weighted average and number of
+  changes in view or between the cursors.
+- **Bits as lanes**: a 0/1 tag is drawn as a thin logic-analyser strip.
+- **Same scale** puts every chart on one value scale; a tag can have a fixed
+  scale, units and a description (double-click it in the value bar).
+- **Back and forward** step through the views you have looked at.
+- **Layouts** save sets of tags, arrangement and range in the profile.
+- **Export** the data in view (or between the cursors) as CSV.
+- **Events** under the charts: socket messages, connections and errors, and the
+  Latency page's pairs as bars from trigger to response. Click one to open it
+  in the Live log.
+- **Flags**: high and low limits, no change for too long, and counter jumps or
+  resets, shaded and marked on the chart and counted in the value bar.
+- **Math pens**: A minus B (and plus, times, divided by), a counter's rate, how
+  long each state lasted.
+- **Compare** with the same time yesterday, last week, or another log.
+- **Cycles**: every cycle overlaid from a trigger, with the envelope of the
+  usual ones and the odd cycles ranked first.
 
 ### 1.6.2 -- 2026-11-10
 

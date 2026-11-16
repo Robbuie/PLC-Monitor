@@ -65,6 +65,8 @@ hidden = scapy_hidden + [
     "app.engine.profiles", "app.engine.tagimport", "app.engine.clock", "app.ui.tagpicker",
     "app.engine.tagspec", "app.ui.tagedit", "sqlite3", "zipfile",
     "psutil", "matplotlib.backends.backend_qtagg",
+    # The Trend chart. Its exporters are imported only when a PNG is saved.
+    "pyqtgraph", "pyqtgraph.exporters", "app.ui.trendchart", "app.engine.trendview",
 ]
 
 EXCLUDE = [
@@ -72,7 +74,9 @@ EXCLUDE = [
     # pyparsing, so excluding it took the Trend and Latency charts out of the
     # build ("No module named 'unittest'"). tests/test_packaging.py checks
     # every runtime import still works with this list taken away.
-    "tkinter", "customtkinter", "pytest", "_pytest", "pydoc",
+    # Not "pydoc" either since 1.7.0: pyqtgraph's exporters (Export PNG on
+    # Trend) load its parametertree, which imports pydoc.
+    "tkinter", "customtkinter", "pytest", "_pytest",
     "PySide6.Qt3DAnimation", "PySide6.Qt3DCore", "PySide6.Qt3DExtras", "PySide6.Qt3DInput",
     "PySide6.Qt3DLogic", "PySide6.Qt3DRender", "PySide6.QtBluetooth", "PySide6.QtCharts",
     "PySide6.QtDataVisualization", "PySide6.QtDesigner", "PySide6.QtHelp",

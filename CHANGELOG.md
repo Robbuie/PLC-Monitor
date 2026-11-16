@@ -3,6 +3,89 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.7.0] - 2026-11-16
+
+A faster Trend chart, and Live.
+
+- Trend is drawn with pyqtgraph (new dependency, MIT licence) instead of
+  matplotlib: panning and zooming a day of changes stays smooth. matplotlib is
+  kept for the Latency histogram.
+- Min/max decimation by time (engine/trendview.py): with more changes in view
+  than pixels, each pixel column is drawn from the lowest to the highest value
+  held in it, worked out again as the view moves, so a spike of a few
+  milliseconds survives on a day-long chart.
+- Live mode replaces "Refresh every 30 s": the chart reads the range's history
+  once, then is fed from the rows the monitor logs (Session.events), with the
+  right edge at now. Robot lines are read again every 5 s. Panning or zooming
+  stops the scrolling; Home resumes it. Live turns off when an archive is
+  picked. Ticked tags with no history yet get a chart that fills in live.
+- Hover readout: a cursor line through every chart and the value each line
+  held at that moment (not the nearest logged point), with the date and time
+  to the millisecond; text strips give the value and when it began and ended.
+- The mouse moves the time axis only; value axes autoscale to what is in view.
+  Changing the arrangement or the theme redraws without reading the file again
+  and keeps the time in view.
+- The last value of each line is drawn up to the end of the range (or now),
+  rather than stopping at its last change.
+- Packaging: pydoc is no longer excluded from the build (pyqtgraph's PNG
+  exporter needs it); pyqtgraph added to the hidden imports and to the
+  packaging test.
+- tools/preview.py writes its made-up log where the profile's logger reads it,
+  so the Trend and Latency previews show PLC tags again.
+
+Measuring on Trend (matching and going past Rockwell's trend tools):
+
+- Cursors A and B (chart header, *Cursors*): drawn on every chart with a band
+  between them, dragged or clicked into place, snapping to the nearest change
+  of any line or strip within 6 px (Shift: no snap). The time between them
+  shows above the value bar.
+- Value bar (app/ui/trendpens.py): a row per pen with the value at the pointer
+  (or the latest), at A, at B, B - A, and min, max, time-weighted average and
+  change count over the view or between the cursors. StepSeries.stats and the
+  change counting work on the slice in range only, so they stay cheap on long
+  live sessions.
+- Booleans (0/1 only) are drawn as logic-analyser lanes, filled while on.
+- Arrangement *Same scale*: a chart per pen on one shared value scale.
+- Pen settings, saved in the profile (engine/trendprefs.py, the config's
+  "trend" block): description, units, fixed scale, draw as lane or chart.
+  Double-click a row of the value bar.
+- View history: Back and Forward beside Home. A drag or a wheel zoom counts as
+  one step once the view has been still for 450 ms; Home and Find steps count
+  too; live scrolling does not. Find's previous/next are now up/down arrows.
+- Layouts (top bar): save and load named sets of ticked tags, robot signals,
+  arrangement, range and cursors in the profile.
+- Export is a menu: chart as PNG, data in view as CSV, data between the cursors
+  as CSV (value held at the start, then every change, with units).
+- Theme: a checked quiet button (Cursors) shows as on.
+
+Past Rockwell (engine/trendmath.py, app/ui/trendtools.py, app/ui/trendcycles.py):
+
+- Events strip: socket RECV/SENT, connection and error rows, and the Latency
+  page's last measurement (Session.latency_spec) as bars from trigger to
+  response, unanswered triggers marked. Hover lists them; a click opens the row
+  in the Live log; cursors snap to them; socket events arrive live.
+- Flags from per-pen rules in the profile (high, low, stuck_s, jump): shaded
+  spans and limit lines on the chart, a Flags column in the value bar (click to
+  step through), recomputed once a second in Live.
+- Math pens (profile "trend.math"): A-B, A+B, A*B, A/B (held between changes of
+  either, divide by zero is a gap), rate over a window per s or min, and the
+  duration of each state (optionally of one value). Their sources are read even
+  when not ticked and are recomputed live.
+- Compare: the ticked tags from another time or log (a day or a week earlier,
+  the same time, or a chosen start) as dashed lines shifted onto the chart, with
+  both values in the readout.
+- Cycles view: triggers on rise, fall, change or a value (text tags too),
+  every pen sampled on a 600-point relative grid, the 5-95 % envelope and
+  median of the reference cycles, cycles ranked by how far outside it they
+  stray; incomplete cycles excluded; untick Reference to leave a cycle out;
+  jump to a cycle on the time chart.
+- The arrangement is a drop-down (Chart per tag / Same scale / One chart) and
+  the Time / Cycles switch sits at the left of the chart header.
+- Fix: reading Trend settings no longer adds an empty "trend" block to the
+  config, which made the window ask to save unsaved changes on every profile
+  switch once Trend had drawn.
+- Fix: theme tokens written rgba(...) are read as colours on the chart.
+
 ## [1.6.2] - 2026-11-10
 
 - Older logs decode without torn values: when the registers of a grouped tag

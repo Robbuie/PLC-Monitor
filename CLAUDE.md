@@ -48,11 +48,16 @@ app/
     tagspec.py       one tag-list entry: address, xN registers, format, name; decoding
     headless.py      the unattended runner (retries the PLC every 15 s)
     logdata.py       reading logs back: trend series, latency pairing
+    trendview.py     what the Trend chart draws: step series, min/max decimation by time, stats
+    trendprefs.py    Trend pen settings, flag rules, math pens and layouts: the profile's "trend" block
+    trendmath.py     math pens, flags, triggers and cycle envelopes, event markers
     robdata.py       reading RobControl's trend recording (SQLite, read-only) for the Trend page
     network_discovery.py   connections, gentle port check, read-only PLC handshakes
   core/              no widgets. settings.py (ui.json), updates.py, themeswitch.py, siblings.py
   theme/             tokens.py (copied from File Manager), qss.py (copied), sheet.py (ours)
   ui/                window, titlebar, rail, widgets, appearance, guide, session, pages/,
+                     trendchart (the pyqtgraph chart behind pages/trend), trendpens (value bar),
+                     trendtools (math pen, compare dialogs), trendcycles (Cycles view),
                      profiles_ui (switcher, details, Manage), tagpicker, tagedit
 packaging/           build.py, plcmonitor.spec, installer.iss, icon.py
 tools/preview.py     offscreen screenshots with a made-up log
@@ -79,6 +84,8 @@ headless_runner.py   kept for old shortcuts
   poller; it is logged under `spec.key` (its name, else `D1916 x4`). Never
   read a group's registers one by one and stitch them: that is the torn-read
   bug grouping exists to fix.
+- Reading Trend settings (engine/trendprefs) never writes into the config:
+  the window spots unsaved edits by comparing the config with a snapshot.
 - The logger writes on its own thread. Anything that reads the file right
   after logging (tests, mostly) calls `logger.flush()` first.
 

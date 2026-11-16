@@ -132,6 +132,12 @@ def main() -> int:
     settings.set("accent", args.accent)
     settings.set("density", args.density)
     session = Session()
+    # Profiles keep their logs in a folder of their own: the made-up log goes
+    # where this session's logger will look for it.
+    if os.path.abspath(session.logger.log_path) != os.path.abspath(
+            os.path.join(data, "logs", "plc_monitor_log.csv")):
+        os.makedirs(os.path.dirname(session.logger.log_path), exist_ok=True)
+        demo_log(session.logger.log_path)
     session.cfg.set("plc", "ip", "10.0.40.11")
     session.cfg.set("plc", "tags_per_driver", {"Rockwell (pycomm3)": [
         {"tag": t, "dtype": "DINT"} for t in
@@ -175,8 +181,31 @@ def main() -> int:
             item.setCheckState(Qt.Checked)
     data = logdata.series(rows, ["Conveyor_Speed", "Part_Present"])
     data.update(robdata.series(db, robots))
+    # Events and latency pairs under the charts, and a flag rule, so the
+    # preview shows them.
+    from app.engine import trendmath, trendprefs
+    trigger = logdata.Matcher("plc", "Part_Present", "True")
+    response = logdata.Matcher("socket", events=("SOCK_RECV",))
+    session.latency_spec = {"trigger": trigger, "response": response, "window_ms": 2000,
+                            "same_value": False, "label": "Part_Present to the next receive"}
+    session.latencySpecChanged.emit()
+    for box in (trend.show_events, trend.show_pairs):
+        box.blockSignals(True)
+        box.setChecked(True)
+        box.blockSignals(False)
+    events = [e for e in map(trendmath.event_of, rows) if e]
+    events += trendmath.pair_events(logdata.measure(rows, trigger, response, window_ms=2000),
+                                    "Part_Present")
+    data["__events__"] = events
+    trendprefs.set_pen(session.cfg.as_dict(), "Conveyor_Speed", {"high": 1400, "units": "mm/s"})
     trend._render(data, ["Conveyor_Speed", "Part_Present"] + [s.name for s in robots],
                   "everything in the file")
+    # The cursors on, a third and two thirds across, so the value bar shows them.
+    trend.cursor_btn.setChecked(True)
+    settle = time.time() + 0.3          # the value bar's stats follow on a short timer
+    while time.time() < settle:
+        app.processEvents()
+        time.sleep(0.02)
     lat = window.pages["latency"]
     lat.trigger.set_choices(*logdata.sources(rows))
     lat.response.set_choices(*logdata.sources(rows))
@@ -198,6 +227,23 @@ def main() -> int:
             target = os.path.join(args.out_dir, f"{theme}-{key}.png")
             window.grab().save(target)
             print(target)
+            if key == "trend" and trend.cycle_view is not None:
+                # The Cycles view: every Part_Present rise, overlaid.
+                trend.view.set_value("cycles")
+                trend._view_changed("cycles")
+                cv = trend.cycle_view
+                cv.trigger.setCurrentIndex(cv.trigger.findText("Part_Present"))
+                cv.edge.setCurrentIndex(cv.edge.findData("rising"))
+                cv.before.setValue(5)
+                cv.after.setValue(40)
+                cv.run()
+                for _ in range(5):
+                    app.processEvents()
+                target = os.path.join(args.out_dir, f"{theme}-trend-cycles.png")
+                window.grab().save(target)
+                print(target)
+                trend.view.set_value("time")
+                trend._view_changed("time")
     session.shutdown()
     return 0
 

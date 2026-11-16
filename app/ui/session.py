@@ -41,6 +41,8 @@ class Session(QObject):
     fill = Signal(str, str)            # field key, value -- "Use as ..." from another page
     goto = Signal(str)                 # bring a page to the front
     configSaved = Signal()
+    #: The Latency page measured: Trend can draw the same pairs.
+    latencySpecChanged = Signal()
     serviceState = Signal(str)
     # Private: the connect thread's answer, delivered on the UI thread.
     _connected = Signal(object, bool, str, list, int)
@@ -69,6 +71,9 @@ class Session(QObject):
         self.sock_detail = ""
         self.event_count = 0
         self.service = "UNKNOWN"
+        # What the Latency page last measured -- {"trigger", "response" (Matchers),
+        # "window_ms", "same_value", "label"} -- so Trend can draw those pairs.
+        self.latency_spec: dict | None = None
         self._pump = QTimer(self)
         self._pump.setInterval(100)
         self._pump.timeout.connect(self._drain)

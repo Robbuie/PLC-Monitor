@@ -354,6 +354,9 @@ class LatencyPage(Page):
         specs = self.session.group_specs()
         if path == self.session.logger.log_path:
             self.session.logger.flush(1.0)
+        self.session.latency_spec = {"trigger": trigger, "response": response,
+                                     "window_ms": window, "same_value": same, "label": label}
+        self.session.latencySpecChanged.emit()
 
         def work():
             try:

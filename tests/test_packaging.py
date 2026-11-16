@@ -17,6 +17,9 @@ RUNTIME = [
     "app.engine.headless", "app.engine.profiles", "app.engine.tagimport", "app.engine.tagspec",
     "app.ui.tagedit", "sqlite3", "zipfile", "xml.etree.ElementTree", "app.instance",
     "matplotlib", "matplotlib.backends.backend_qtagg", "matplotlib.figure",
+    "pyqtgraph", "pyqtgraph.exporters", "app.ui.trendchart", "app.engine.trendview",
+    "app.ui.trendpens", "app.engine.trendprefs", "app.engine.trendmath",
+    "app.ui.trendtools", "app.ui.trendcycles",
     "numpy", "psutil", "pycomm3", "snap7", "snap7.client", "snap7.util", "pymcprotocol",
     "scapy.all",
 ]
