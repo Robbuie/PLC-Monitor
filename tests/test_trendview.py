@@ -181,3 +181,15 @@ def test_pen_settings_and_layouts_in_the_profile_config():
     saved = trendprefs.layouts(cfg)[name]
     assert saved["arrange"] == "stacked" and saved["range"] == 5.0 and saved["tags"] == ["A", "B"]
     assert trendprefs.delete_layout(cfg, name) and not trendprefs.layouts(cfg)
+
+
+def test_epoch_near_1970_when_the_platform_refuses():
+    # What Windows does with a naive datetime within a day of 1970.
+    class Refusing(datetime):
+        def timestamp(self):
+            raise OSError(22, "Invalid argument")
+
+    real = datetime.fromtimestamp(1.5)
+    when = Refusing(real.year, real.month, real.day, real.hour, real.minute,
+                    real.second, real.microsecond)
+    assert trendview.epoch(when) == 1.5

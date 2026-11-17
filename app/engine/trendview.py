@@ -31,8 +31,25 @@ import numpy as np
 MAX_POINTS = 2_000_000
 
 
+#: Ten days after 1970-01-01: comfortably past where Windows gives up.
+_ANCHOR = 10 * 86400
+
+
 def epoch(when: datetime) -> float:
-    return when.timestamp()
+    """Seconds since 1970 for a local (naive) or aware datetime.
+
+    On Windows a naive datetime within a day of 1970 cannot be converted
+    directly: CPython looks up the local offset a day earlier, before the
+    epoch, and Windows' localtime refuses with OSError 22. Real logs never
+    come near 1970 but small test timestamps do, so such a time is measured
+    from an anchor ten days in instead.
+    """
+    try:
+        return when.timestamp()
+    except (OSError, OverflowError, ValueError):
+        if when.tzinfo is not None:
+            raise
+        return _ANCHOR + (when - datetime.fromtimestamp(_ANCHOR)).total_seconds()
 
 
 class StepSeries:
