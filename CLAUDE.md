@@ -45,6 +45,8 @@ app/
     profiles.py      profiles (ProgramData\profiles\*.json), the service pointer, first-run migration
     clock.py         the precise wall clock every row is stamped with
     tagimport.py     GX Works3 .gx3 / L5X / tag CSV / plain list -> tag entries
+    tagbrowse.py     a Rockwell controller's own tag list (pycomm3 upload or libplctag
+                     @tags/@udt) -> the Browse PLC tree, lazily expanded, and its search
     tagspec.py       one tag-list entry: address, xN registers, format, name; decoding
     headless.py      the unattended runner (retries the PLC every 15 s)
     logdata.py       reading logs back: trend series, latency pairing
@@ -58,7 +60,8 @@ app/
   ui/                window, titlebar, rail, widgets, appearance, guide, session, pages/,
                      trendchart (the pyqtgraph chart behind pages/trend), trendpens (value bar),
                      trendtools (math pen, compare dialogs), trendcycles (Cycles view),
-                     profiles_ui (switcher, details, Manage), tagpicker, tagedit
+                     profiles_ui (switcher, details, Manage), tagpicker, tagedit,
+                     tagbrowser (Browse PLC)
 packaging/           build.py, plcmonitor.spec, installer.iss, icon.py
 tools/preview.py     offscreen screenshots with a made-up log
 tests/
@@ -109,6 +112,9 @@ vision; a tag keeps its colour for the session; eight lines maximum.
 - One host per check; broadcast addresses are refused.
 - Handshakes are reads (ListIdentity, COTP CR, MC read of D0). Nothing here
   writes to a PLC. Adding a write is a change to these rules first.
+- Browse PLC is a read too: the Symbol and Template objects describe
+  themselves (pycomm3's tag upload, libplctag's @tags and @udt). It opens its
+  own connection and closes it when the list is in.
 - Passive sniff transmits nothing.
 - Robots are RobControl's: PLC Monitor reads RobControl's recording
   (`robcontrol.db`, opened `mode=ro`) and never sends anything to a robot.

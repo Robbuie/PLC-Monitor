@@ -425,3 +425,72 @@ def test_latency_page_matches_on_value_and_decodes_old_logs(window, app, tmp_pat
         _time.sleep(0.02)
     assert page._result is not None
     assert page._result.answered == [2000]       # stamped by the last register of each poll
+
+
+def test_selection_bar_names_the_selected_tag_and_removes_it(window, app):
+    tags = window.pages["tags"]
+    for t in ("Speed", "Count"):
+        tags.new_tag.setText(t)
+        tags._add()
+    tags.table.clearSelection()
+    assert tags.selbar.property("state") == "" and not tags.remove_btn.isVisibleTo(tags)
+    assert "Nothing selected" in tags.sel_text.text()
+    row = [r["spec"].key for r in tags.model.rows].index("Speed")
+    tags.table.selectRow(row)
+    assert tags.sel_text.text() == "Selected: Speed"
+    assert tags.selbar.property("state") == "on" and tags.remove_btn.isVisibleTo(tags)
+    tags.table.selectAll()
+    assert tags.sel_text.text() == f"{len(tags.model.rows)} tags selected"
+    assert tags.remove_btn.text() == f"Remove {len(tags.model.rows)}"
+    tags.table.clearSelection()
+    tags.table.selectRow(row)
+    tags._remove()
+    assert "Speed" not in [r["spec"].key for r in tags.model.rows]
+    assert "Nothing selected" in tags.sel_text.text()
+
+
+def test_browse_plc_adds_ticked_members(window, app, monkeypatch):
+    import struct as st
+    from app.engine import tagbrowse as tb
+    from app.ui import tagbrowser
+
+    def entry(name, typ, dims=(0, 0, 0)):
+        return st.pack("<IHHIIIH", 1, typ, 4, *dims, len(name)) + name.encode()
+
+    timer = (st.pack("<HIIHH", 0xF83, 0, 12, 2, 0) + st.pack("<HHI", 0, 0xC4, 4)
+             + st.pack("<HHI", 0, 0xC4, 8) + b"TIMER;n\x00PRE\x00ACC\x00")
+    listing = entry("Part_Present", 0xC1) + entry("Cycle", 0x8000 | 0xF83, (0, 0, 0))
+    db = tb.assemble(tb.parse_tag_list(listing), {}, lambda i: tb.parse_udt(timer), "fake")
+    monkeypatch.setattr(tb, "browse_pycomm3", lambda *a, **k: db)
+
+    def run(dialog):
+        deadline = __import__("time").time() + 5
+        while dialog.db is None and __import__("time").time() < deadline:
+            app.processEvents()
+        controller = dialog.tree.topLevelItem(0)
+        assert controller.isExpanded()
+        items = {controller.child(i).text(0): controller.child(i)
+                 for i in range(controller.childCount())}
+        # Part_Present is already on the page: shown, not tickable.
+        assert not items["Part_Present"].flags() & Qt.ItemIsUserCheckable
+        items["Cycle"].setExpanded(True)
+        acc = next(items["Cycle"].child(i) for i in range(items["Cycle"].childCount())
+                   if items["Cycle"].child(i).text(0) == "ACC")
+        acc.setCheckState(0, Qt.Checked)
+        # Ticks survive a search and its clearing.
+        dialog.search.setText("PRE")
+        dialog._refill()
+        assert dialog.tree.topLevelItem(0).text(2) == "Cycle.PRE"
+        dialog.tree.topLevelItem(0).setCheckState(0, Qt.Checked)
+        dialog.search.clear()
+        dialog._refill()
+        assert dialog.add_btn.text() == "Add 2"
+        return 1
+
+    monkeypatch.setattr(tagbrowser.TagBrowserDialog, "exec", run)
+    tags = window.pages["tags"]
+    tags.driver.setCurrentText("Rockwell (pycomm3)")
+    tags.ip.setText("10.0.40.11")
+    tags._browse()
+    keys = [r["spec"].key for r in tags.model.rows]
+    assert "Cycle.ACC" in keys and "Cycle.PRE" in keys

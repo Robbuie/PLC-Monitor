@@ -3,6 +3,33 @@
 One section per version. The release workflow copies the matching section onto
 the GitHub release page. The same entries are at the bottom of README.md.
 
+## [1.8.0] - 2026-11-17
+
+Pick tags straight from the PLC, and see what you have selected.
+
+- Browse PLC... on the Tags page (Rockwell pycomm3 and libplctag): reads the
+  controller's tag list on a connection of its own and shows it as a tree --
+  controller tags, each program, I/O modules. UDTs, predefined structures
+  (TIMER, COUNTER, module data) and arrays open on demand down to single
+  values; multi-dimensional arrays read as `Tag[i,j]`; arrays over 200
+  elements open in pages; BOOL arrays open to bits; Logix STRINGs are one
+  value. Search covers members inside structures (an array is listed once).
+  Ticks survive searching; tags already on the page show ticked and greyed.
+  New: engine/tagbrowse.py (no Qt, tested with built listings) and
+  ui/tagbrowser.py.
+- pycomm3: the browser keeps LogixDriver's tag upload (init_tags) instead of
+  polling with it. libplctag: `@tags`, `Program:<name>.@tags` and
+  `@udt/<id>`, decoded as libplctag's list_tags_logix tool does. PCCC
+  controllers are refused with an explanation. Both are reads.
+- Tags table: the selected row is marked with an accent bar and a bold name
+  (RowDelegate). Edit... and Remove moved from beside Add to a selection bar
+  above the table that names the selection (or says nothing is selected) and
+  keeps its height either way. Edit becomes Combine... with several rows
+  selected; Remove shows the count. Delete removes, Esc clears, right-click
+  menu. Removing reports what went in the status bar.
+- tools/preview.py selects a tag and renders the Browse PLC dialog
+  (`<theme>-tags-browse.png`).
+
 ## [1.7.0] - 2026-11-16
 
 A faster Trend chart, and Live.

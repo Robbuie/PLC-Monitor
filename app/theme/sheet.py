@@ -195,6 +195,19 @@ QFrame[role="banner"][tone="down"] {{ background: {down_soft}; }}
 QFrame[role="banner"][tone="info"] {{ background: {accent_soft}; }}
 QFrame[role="banner"] QLabel {{ background: transparent; color: {txt_0}; }}
 
+/* The Tags page's selection bar: quiet until a row is selected, then the
+   accent wash with the selection named in accent ink. */
+QFrame[role="selbar"] {{
+    background: transparent;
+    border: 1px dashed {line_soft};
+    border-radius: {radius};
+    min-height: 30px;
+}}
+QFrame[role="selbar"][state="on"] {{ background: {accent_soft}; border: 1px solid {accent_line}; }}
+QFrame[role="selbar"] QLabel {{ background: transparent; }}
+QLabel[role="selection"] {{ color: {txt_2}; }}
+QLabel[role="selection"][state="on"] {{ color: {accent_ink}; font-weight: 600; }}
+
 QFrame[role="rule"] {{ background: {line_soft}; border: none; max-height: 1px; min-height: 1px; }}
 
 /* --------------------------------------------------------------- buttons */

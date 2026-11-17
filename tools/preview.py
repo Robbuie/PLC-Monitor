@@ -101,6 +101,83 @@ def demo_robots(path: str, minutes: int = 50) -> None:
     db.close()
 
 
+def demo_tag_database():
+    """A made-up controller for the Browse PLC dialog, shaped as pycomm3's
+    LogixDriver.tags returns it."""
+    from app.engine import tagbrowse
+
+    def atomic(t, dims=()):
+        return {"tag_type": "atomic", "data_type_name": t, "data_type": t,
+                "dim": len(dims), "dimensions": list(dims) + [0] * (3 - len(dims))}
+
+    def member(t, **extra):
+        return {"data_type_name": t, "tag_type": "atomic", **extra}
+
+    timer = {"name": "TIMER", "attributes": ["PRE", "ACC", "EN", "TT", "DN"],
+             "internal_tags": {"PRE": member("DINT"), "ACC": member("DINT"),
+                               "EN": member("BOOL", bit=31), "TT": member("BOOL", bit=30),
+                               "DN": member("BOOL", bit=29)}}
+    string = {"name": "STRING", "string": 82}
+    station = {"name": "StationUDT", "attributes": ["Ready", "Busy", "Count", "Cycle", "Vin",
+                                                    "Faults", "Temps"],
+               "internal_tags": {
+                   "Ready": member("BOOL", bit=0), "Busy": member("BOOL", bit=1),
+                   "Count": member("DINT"),
+                   "Cycle": {"data_type_name": "TIMER", "tag_type": "struct", "data_type": timer},
+                   "Vin": {"data_type_name": "STRING", "tag_type": "struct", "data_type": string},
+                   "Faults": member("DWORD", array=1), "Temps": member("REAL", array=4)}}
+    tags = {
+        "Conveyor_Speed": atomic("REAL"), "Oven_Temp": atomic("REAL"),
+        "Part_Present": atomic("BOOL"), "Robot_Fault": atomic("BOOL"),
+        "Line_State": atomic("DINT"), "Recipe_Name": {**atomic("STRING"),
+                                                      "tag_type": "struct", "data_type": string},
+        "Station": {"tag_type": "struct", "data_type_name": "StationUDT", "data_type": station,
+                    "dim": 1, "dimensions": [6, 0, 0]},
+        "Shift_Counts": atomic("DINT", (3,)),
+        "Program:Main.Cycle_Count": atomic("DINT"),
+        "Program:Main.Cycle_Timer": {"tag_type": "struct", "data_type_name": "TIMER",
+                                     "data_type": timer, "dim": 0},
+        "Program:Vision.Result": atomic("DINT"),
+        "Local:1:I": {"tag_type": "struct", "data_type_name": "StationUDT",
+                      "data_type": station, "dim": 0},
+    }
+    return tagbrowse.from_pycomm3(tags, ["Main", "Vision"], "10.0.40.11, slot 0 (pycomm3)")
+
+
+def browse_preview(app, tags, target: str) -> None:
+    """The Browse PLC dialog with Station[2] open and two members ticked."""
+    from PySide6.QtCore import Qt
+    from app.ui.tagbrowser import TagBrowserDialog
+
+    db = demo_tag_database()
+    existing = {r["spec"].key for r in tags.model.rows}
+    dialog = TagBrowserDialog(lambda progress: db, existing, tags)
+    dialog.show()
+    deadline = time.time() + 5
+    while dialog.db is None and time.time() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    controller = dialog.tree.topLevelItem(0)
+
+    def child(item, text):
+        return next(item.child(i) for i in range(item.childCount()) if item.child(i).text(0) == text)
+
+    station = child(controller, "Station")
+    station.setExpanded(True)
+    second = child(station, "[2]")
+    second.setExpanded(True)
+    for name in ("Ready", "Vin"):
+        child(second, name).setCheckState(0, Qt.Checked)
+    child(second, "Cycle").setExpanded(True)
+    child(child(second, "Cycle"), "ACC").setCheckState(0, Qt.Checked)
+    dialog.tree.setCurrentItem(child(second, "Count"))
+    for _ in range(5):
+        app.processEvents()
+    dialog.grab().save(target)
+    dialog.reject()
+    dialog.deleteLater()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out-dir", default="previews")
@@ -158,6 +235,8 @@ def main() -> int:
         tags.model.update_value(tag, value, "")
         tags.model.update_value(tag, value + "0" if "." in value else value, time.strftime("%H:%M:%S.123"))
     tags.model.update_value("Robot_Fault", "ERROR: Tag doesn't exist", "")
+    # One tag selected, as when about to edit or remove it.
+    tags.table.selectRow(1)
     session.plcState.emit("on", "Rockwell (pycomm3) at 10.0.40.11")
     session.sockState.emit("on", "sniffing 10.0.40.50 9000")
 
@@ -227,6 +306,10 @@ def main() -> int:
             target = os.path.join(args.out_dir, f"{theme}-{key}.png")
             window.grab().save(target)
             print(target)
+            if key == "tags":
+                target = os.path.join(args.out_dir, f"{theme}-tags-browse.png")
+                browse_preview(app, tags, target)
+                print(target)
             if key == "trend" and trend.cycle_view is not None:
                 # The Cycles view: every Part_Present rise, overlaid.
                 trend.view.set_value("cycles")

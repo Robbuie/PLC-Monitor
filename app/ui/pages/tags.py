@@ -19,7 +19,7 @@ import threading
 import time
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -28,7 +28,11 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QScrollArea,
     QSpinBox,
+    QFrame,
+    QHBoxLayout,
+    QMenu,
     QSplitter,
+    QStyle,
     QStyledItemDelegate,
     QTableView,
 )
@@ -266,7 +270,32 @@ class TagModel(QAbstractTableModel):
         return True
 
 
-class TypeDelegate(QStyledItemDelegate):
+class RowDelegate(QStyledItemDelegate):
+    """Marks a selected row beyond the selection wash.
+
+    The wash alone sits close to the stripe of an alternate row and to the
+    green a changed value flashes, so on a busy line it was not obvious which
+    tag Edit and Remove would act on. The selected row also gets an accent bar
+    down its left edge and its name in bold -- both readable at a glance and
+    neither a colour that means anything else on this page.
+    """
+
+    BAR = 3
+
+    def initStyleOption(self, option, index):  # noqa: N802
+        super().initStyleOption(option, index)
+        if index.column() == 0 and option.state & QStyle.State_Selected:
+            option.font.setBold(True)
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index.column() == 0 and option.state & QStyle.State_Selected:
+            rect = option.rect
+            painter.fillRect(rect.left(), rect.top(), self.BAR, rect.height(),
+                             QColor(sheet.tokens()["accent"]))
+
+
+class TypeDelegate(RowDelegate):
     def createEditor(self, parent, option, index):  # noqa: N802
         box = QComboBox(parent)
         box.addItems(DATA_TYPES)
@@ -424,19 +453,48 @@ class TagsPage(Page):
         self.new_type = QComboBox()
         self.new_type.addItems(DATA_TYPES)
         self.new_type.setCurrentText("DINT")
-        add = w.button("Add", icon_name="plus", slot=self._add)
-        remove = w.button("Remove", icon_name="minus", slot=self._remove,
-                          tip="Remove the selected tags")
-        edit = w.button("Edit...", slot=self._edit,
-                        tip="Name the selected tag, or read it as text or a number over several "
-                            "registers. Select several consecutive registers to combine them.")
+        add = w.button("Add", icon_name="plus", slot=self._add,
+                       tip="Add the tag typed on the left")
         import_btn = w.button("Import...", slot=self._import,
                               tip="Add tags from a GX Works3 project (.gx3), a Studio 5000 L5X "
                                   "or tag CSV export, or any CSV or text list of tag names")
-        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, remove, edit,
-                                        import_btn, stretch_at=0))
+        self.browse_btn = w.button("Browse PLC...", icon_name="search", slot=self._browse,
+                                   tip="Read the tag list from the controller and tick the tags "
+                                       "to watch. Rockwell Logix and Micro800 only. Reads only.")
+        table_card.body.addLayout(w.row(self.new_tag, self.new_type, add, import_btn,
+                                        self.browse_btn, stretch_at=0))
         self.example = w.label("", "hint", wrap=True)
         table_card.body.addWidget(self.example)
+
+        # The selection bar. Edit and Remove used to sit beside Add, where it
+        # was not clear whether they acted on the text being typed or on a row
+        # of the table -- or on which row. They live here now, beside the
+        # name of what is selected, and are only there when something is.
+        self.selbar = QFrame()
+        self.selbar.setProperty("role", "selbar")
+        self.selbar.setAttribute(Qt.WA_StyledBackground, True)
+        bar = QHBoxLayout(self.selbar)
+        bar.setContentsMargins(12, 4, 4, 4)
+        bar.setSpacing(6)
+        self.sel_text = w.label("", "selection")
+        self.sel_text.setTextFormat(Qt.PlainText)
+        self.edit_btn = w.button("Edit...", slot=self._edit,
+                                 tip="Name the selected tag, or read it as text or a number over "
+                                     "several registers. Select several consecutive registers to "
+                                     "combine them.")
+        self.remove_btn = w.button("Remove", "danger", icon_name="trash", slot=self._remove,
+                                   tip="Remove the selected tags from the list (Delete)")
+        self.clear_sel = w.tool("close", "Clear the selection (Esc)",
+                                lambda: self.table.clearSelection())
+        bar.addWidget(self.sel_text, 1)
+        for widget in (self.edit_btn, self.remove_btn, self.clear_sel):
+            # Hidden but still taking their room, so the bar keeps its height
+            # and the table does not jump when a row is clicked.
+            policy = widget.sizePolicy()
+            policy.setRetainSizeWhenHidden(True)
+            widget.setSizePolicy(policy)
+            bar.addWidget(widget)
+        table_card.body.addWidget(self.selbar)
 
         self.model = TagModel(self)
         self.table = QTableView()
@@ -452,9 +510,21 @@ class TagsPage(Page):
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setHighlightSections(False)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.row_delegate = RowDelegate(self.table)
         self.type_delegate = TypeDelegate(self.table)
+        self.table.setItemDelegate(self.row_delegate)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        for keys, slot in ((QKeySequence.Delete, self._remove),
+                           (QKeySequence(Qt.Key_Escape), self.table.clearSelection)):
+            shortcut = QShortcut(keys, self.table)
+            shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.activated.connect(slot)
+        self.table.selectionModel().selectionChanged.connect(self._selection_changed)
         table_card.body.addWidget(self.table, 1)
-        table_card.body.addWidget(w.label("Double-click a tag to rename it. Values flash when they change.", "hint"))
+        table_card.body.addWidget(w.label(
+            "Click a tag to select it; Ctrl or Shift for several. Double-click to rename. "
+            "Values flash when they change.", "hint", wrap=True))
         split.addWidget(table_card)
         split.setStretchFactor(1, 1)
 
@@ -574,7 +644,7 @@ class TagsPage(Page):
                 self.s7slot.setValue(DEFAULT_SLOTS.get(kind, 1))
         self.new_type.setVisible(is_lpt)
         self.model.load(self._tags.get(kind, []), typed=is_lpt)
-        self.table.setItemDelegateForColumn(1, self.type_delegate if is_lpt else None)
+        self.table.setItemDelegateForColumn(1, self.type_delegate if is_lpt else self.row_delegate)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         for column in range(1, self.model.columnCount()):
@@ -583,6 +653,8 @@ class TagsPage(Page):
                                         or "Tag name")
         self.example.setText("Formats: " + TAG_EXAMPLES.get(kind, "").replace("  |  ", ", "))
         self._tags_changed()
+        self._selection_changed()
+        self.browse_btn.setVisible(kind in (LPT, PYCOMM3))
         if is_lpt:
             self._update_attrib()
             self._check_dll()
@@ -717,10 +789,92 @@ class TagsPage(Page):
         self.session.status.emit(f"Added {added} tag{'s' if added != 1 else ''} from "
                                  f"{os.path.basename(path)}")
 
+    def _browse(self) -> None:
+        """Read the tag list from the controller and add the ticked tags.
+
+        Uses the fields as they stand, on a connection of its own, so it
+        works whether or not the page is polling.
+        """
+        from app.engine import tagbrowse
+        from app.ui.tagbrowser import TagBrowserDialog
+
+        kind = self.driver.currentText()
+        ip = self.ip.text().strip()
+        if not ip:
+            self.session.status.emit("Enter the PLC's IP address first.")
+            self.ip.setFocus()
+            return
+        if kind == PYCOMM3:
+            slot = self.slot.value()
+            source = self._iface_ips.get(self.iface.currentText(), "")
+
+            def load(progress):
+                return tagbrowse.browse_pycomm3(ip, slot, source, progress)
+        elif kind == LPT:
+            from app.engine.libplctag_driver import LibPlcTagConfig
+            cfg = LibPlcTagConfig(gateway=ip, path=self.lpt_path.text().strip(),
+                                  cpu=self.lpt_cpu.currentText().strip() or "lgx",
+                                  protocol=self.lpt_proto.currentText(),
+                                  timeout_ms=self.lpt_timeout.value(),
+                                  debug=self.lpt_debug.value(), dll_path=self.dll_path)
+
+            def load(progress):
+                return tagbrowse.browse_libplctag(cfg, progress)
+        else:
+            return
+        existing = {r["spec"].key for r in self.model.rows} | {
+            r["spec"].address for r in self.model.rows if not r["spec"].grouped}
+        dialog = TagBrowserDialog(load, existing, self)
+        if not dialog.exec():
+            return
+        added = 0
+        for address, dtype in dialog.chosen():
+            dtype = dtype.upper() if dtype.upper() in DATA_TYPES else self.new_type.currentText()
+            if self.model.add(TagSpec(address=address), dtype):
+                added += 1
+        self.session.status.emit(f"Added {added} tag{'s' if added != 1 else ''} from {ip}")
+
     def _remove(self) -> None:
         rows = [i.row() for i in self.table.selectionModel().selectedRows()]
-        if rows:
-            self.model.remove(rows)
+        if not rows:
+            return
+        names = [self.model.rows[i]["spec"].key for i in sorted(rows)]
+        self.model.remove(rows)
+        self.table.clearSelection()
+        self._selection_changed()
+        self.session.status.emit(f"Removed {names[0]}" if len(names) == 1
+                                 else f"Removed {len(names)} tags")
+
+    def selected_rows(self) -> list[int]:
+        return sorted(i.row() for i in self.table.selectionModel().selectedRows())
+
+    def _selection_changed(self, *_) -> None:
+        rows = [i for i in self.selected_rows() if i < len(self.model.rows)]
+        on = bool(rows)
+        if not rows:
+            text = "Nothing selected. Click a tag to edit or remove it."
+        elif len(rows) == 1:
+            text = f"Selected: {self.model.rows[rows[0]]['spec'].key}"
+        else:
+            text = f"{len(rows)} tags selected"
+        self.sel_text.setText(text)
+        w.set_prop(self.selbar, "state", "on" if on else "")
+        w.set_prop(self.sel_text, "state", "on" if on else "")
+        for widget in (self.edit_btn, self.remove_btn, self.clear_sel):
+            widget.setVisible(on)
+        self.remove_btn.setText("Remove" if len(rows) < 2 else f"Remove {len(rows)}")
+        self.edit_btn.setText("Edit..." if len(rows) < 2 else "Combine...")
+
+    def _context_menu(self, pos) -> None:
+        index = self.table.indexAt(pos)
+        if not index.isValid():
+            return
+        if index.row() not in self.selected_rows():
+            self.table.selectRow(index.row())
+        menu = QMenu(self)
+        menu.addAction(self.edit_btn.text(), self._edit)
+        menu.addAction(self.remove_btn.text(), self._remove)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _tags_changed(self, *_):
         self._tags[self._current_driver] = self.model.entries()

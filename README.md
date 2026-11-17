@@ -207,10 +207,18 @@ Choose the **PLC family** first; the fields follow it.
 | Siemens S7-300/400/1200/1500 | snap7 | S7-300 is usually slot 2, 1200/1500 slot 1. |
 | Mitsubishi iQ-R / Q / L / FX | MC Protocol | Choose the series and frame. |
 
-Add tags in the box above the table, then **Connect**. Each value updates on
-every poll and flashes when it changes; *Changes* counts them. Every change is
-written to the log with its old and new value. Double-click a tag to rename it.
-Each family keeps its own tag list, so switching back and forth loses nothing.
+Add tags in the box above the table (or with **Browse PLC...** or
+**Import...**, below), then **Connect**. Each value updates on every poll and
+flashes when it changes; *Changes* counts them. Every change is written to the
+log with its old and new value. Double-click a tag to rename it. Each family
+keeps its own tag list, so switching back and forth loses nothing.
+
+**Selecting tags.** Click a tag to select it (Ctrl or Shift for several). The
+selected row gets an accent bar down its left edge and its name in bold, and
+the bar above the table names what is selected -- *Selected: Oven_Temp*, or
+*3 tags selected* -- with **Edit...** and **Remove** beside it. Those act on
+the selection only, never on the text in the box. **Delete** removes the
+selection, **Esc** clears it, and a right-click on a row offers the same.
 
 **Grouped tags: text and numbers that span registers.** A PLC often keeps
 one value in several registers: a VIN as ASCII text two characters per
@@ -220,8 +228,8 @@ numbers (12338, 12854 ...) on separate rows. Instead:
 
 - type `D1916 x4 ascii` in the box (or `D200 int32`, `D300 x2 bcd`,
   `DB10,WORD20 x4 ascii`, `Data[16] x4 ascii`) and **Add**; or
-- tick several consecutive registers already in the list and press
-  **Edit...** to combine them; or
+- select several consecutive registers already in the list and press
+  **Combine...** on the selection bar; or
 - select a tag and press **Edit...** (or double-click its *Read as*) to give
   it a **name** -- *Plant VIN* -- and choose how it is read: Text (ASCII),
   INT16, UINT16, INT32, UINT32, REAL, BCD or Hex, with byte and word order
@@ -246,6 +254,29 @@ for a single poll, read half before and half after it was cleared -- cannot
 be rebuilt and shows as the part that was read. Remove the single registers (D1916...D1919) from the tag
 list once the group is set up: the group reads them in one request, which is
 what keeps new logs free of torn values.
+
+**Browse PLC...** (Rockwell only) reads the tag list from the controller
+itself and lets you tick the tags to watch -- no project file needed. It uses
+the address, slot or path typed on the left, on a connection of its own, so it
+works whether or not the page is polling. The tree is laid out as Studio 5000
+shows it: *Controller tags*, then each *Program:*, then *I/O modules*. A UDT,
+a TIMER or a module's `:I` data opens into its members, an array into its
+elements (a long one in pages of 200), down to single values -- tick
+`Station[2].Cycle.ACC` or `Robot_Faults[17]` and **Add**. Search finds a tag or
+member by name or data type anywhere in the tree; ticks are kept while you
+search. Tags already in the list show ticked and greyed. A Logix STRING is one
+value, read as text.
+
+- **pycomm3** (ControlLogix, CompactLogix) uploads the tag database the same
+  way it does on Connect; a big program takes a few seconds.
+- **libplctag** reads the controller's `@tags` listings and structure
+  templates. Works with ControlLogix, CompactLogix and Micro800. PLC-5, SLC 500
+  and MicroLogix have no named tags to list -- type their file addresses
+  (`N7:0`, `B3:0/1`) as before.
+
+Browsing only reads: the controller is asked to describe its tags, nothing is
+written. Descriptions are not something a controller reports; import an L5X
+for those.
 
 **Import...** fills the list from a file instead of typing:
 
@@ -637,6 +668,19 @@ A release is a tag push: bump `__version__` in `app/__init__.py` and
 ---
 
 ## Changelog
+
+### 1.8.0 -- 2026-11-17
+
+Pick tags straight from the PLC, and see what you have selected.
+
+- **Browse PLC...** on the Tags page (Rockwell): reads the controller's tag list
+  and shows it as a tree -- controller tags, programs, I/O modules -- where UDTs,
+  timers and arrays open down to the single values to tick. Search reaches
+  members inside structures. Read-only; works with pycomm3 and libplctag.
+- **A clear selection**: the selected tag is marked with an accent bar and bold
+  name, and a bar above the table names it with **Edit...** and **Remove**
+  beside it. Delete removes, Esc clears, right-click works too. Edit and Remove
+  no longer sit beside Add, where it was not clear what they acted on.
 
 ### 1.7.0 -- 2026-11-16
 
